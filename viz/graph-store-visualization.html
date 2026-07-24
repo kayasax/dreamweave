@@ -232,6 +232,10 @@ const data = {"nodes":[],"links":[]};
   const isTemporalRel=r=>TEMPORAL_RELS.has(r);
   const isTimeRefHub=n=>n.kind==='entity'&&/^ref:(?:19|20)\d{2}(?:[-:]\d{1,2}){0,2}$/.test(n.id);
   let linkMode='semantic', edgeMode=rawLinks.length>1000?'hover':'always';
+  // temporal-mode chronicle drill-down: which chronicle (if any) is expanded, and the set of
+  // evidence-fact ids currently ringed around it. chronEvidence maps chronicle id -> [factNode].
+  let expandedChron=null, expandedSet=new Set();
+  const chronEvidence=new Map();
   const refHub=new Uint8Array(nodes.length);
   nodes.forEach(n=>{ if(isTimeRefHub(n)) refHub[n.idx]=1; });
   const adjSem=nodes.map(()=>[]), adjTmp=nodes.map(()=>[]);
@@ -289,8 +293,11 @@ const data = {"nodes":[],"links":[]};
   function nodeVis(n){ if(!passesFilter(n)) return false;
     if(linkMode==='semantic'){ if(refHub[n.idx]||n.kind==='chronicle') return false; return true; }
     if(refHub[n.idx]) return false;
-    if(!n._thas) return false;
-    return true; }
+    // Temporal mode shows ONLY chronicle nodes by default. Clicking a chronicle reveals its
+    // supporting evidence facts as a ring around it (expandedSet); everything else stays hidden.
+    if(n.kind==='chronicle') return !!n._thas;
+    if(n.kind==='fact') return expandedChron!=null && expandedSet.has(n.id);
+    return false; }
   const avgCol=(a,b)=>{ const ca=baseColor(a),cb=baseColor(b); return [(ca[0]+cb[0])>>1,(ca[1]+cb[1])>>1,(ca[2]+cb[2])>>1]; };
   // In temporal mode a node with no sequence/supersedes edge is kept as faint background
   // context (the nebula shape stays legible) while the lineages render bright on top.
@@ -449,6 +456,15 @@ const data = {"nodes":[],"links":[]};
       f._tx=c._tx+((i%2)?1:-1)*(6+4*i); f._ty=c._ty-40-20*i; f._tz=0; f._thas=1; f._pull=2.6; }
     for(const n of nodes){ if(n.kind==='fact' && n._thas==null) n._thas=0; if(n.kind==='entity') n._thas=0; }
   })();
+  // Map every chronicle -> its supporting evidence facts (chronicle_evidence links, either
+  // direction). Used by the click-to-expand ring in temporal mode. A fact may support several
+  // chronicles (day + week + month …); each chronicle owns the full list of what it summarizes.
+  for(const l of rawLinks){ if(l.rel!=='chronicle_evidence') continue;
+    const a=byId.get(l.source), b=byId.get(l.target);
+    const c=(a&&a.kind==='chronicle')?a:((b&&b.kind==='chronicle')?b:null);
+    const f=(a&&a.kind==='chronicle')?b:a; if(!c||!f||f.kind!=='fact') continue;
+    if(!chronEvidence.has(c.id)) chronEvidence.set(c.id,[]);
+    const arr=chronEvidence.get(c.id); if(!arr.some(x=>x.id===f.id)) arr.push(f); }
 
   // ---- TIMELINE <-> NEBULA transition ----
   let _tlRAF=0;
@@ -464,7 +480,7 @@ const data = {"nodes":[],"links":[]};
       } }
     try { if(Graph.d3Force('link')) Graph.d3Force('link').strength(on?0.02:0.22); } catch(_){}
     try { if(Graph.d3Force('charge')) Graph.d3Force('charge').strength(on?-7:-LAYOUT.charge); } catch(_){}
-    const ctrl=Graph.controls(); if(ctrl){ ctrl.autoRotate=!on; ctrl.enableRotate=!on; }
+    const ctrl=Graph.controls(); if(ctrl){ ctrl.enableRotate=true; ctrl.autoRotate=autoRotate; }
     cancelAnimationFrame(_tlRAF);
     if(on){
       const chr=[]; for(const o of gd){ const n=byId.get(o.id); if(n&&n.kind==='chronicle'&&n._thas){ chr.push({o:o, tx:n._tx, ty:n._ty, sx:(o.x==null?n._tx:o.x), sy:(o.y==null?n._ty:o.y), sz:(o.z==null?0:o.z)}); } }
@@ -505,8 +521,10 @@ const data = {"nodes":[],"links":[]};
       .linkVisibility(linkVis)
       .linkDirectionalParticles(l=>{ if(hop===null||!linkActive(l))return 0; const [s,t]=endIds(l); const a=byId.get(s),b=byId.get(t); return (a&&b&&(hop[a.idx]===0||hop[b.idx]===0))?2:0; })
       .linkDirectionalParticleWidth(1.4).linkDirectionalParticleSpeed(0.006)
-      .onNodeClick(o=>{ focusOn(o.id); flyTo(o); })
-      .onBackgroundClick(()=>{ focusId=null; hideDetail(); recomputeHops(); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); })
+      .onNodeClick(o=>{ const n=byId.get(o.id);
+        if(linkMode==='temporal' && n && n.kind==='chronicle'){ toggleChronicle(o.id); }
+        focusOn(o.id); flyTo(o); })
+      .onBackgroundClick(()=>{ if(linkMode==='temporal') collapseChronicle(); focusId=null; hideDetail(); recomputeHops(); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); })
       .onNodeHover(o=>{ elGraph.style.cursor=o?'pointer':null; hoverId=o?o.id:null; if(edgeMode==='hover') refresh(); });
     Graph.d3Force('charge').strength(-LAYOUT.charge);
     if(Graph.d3Force('link')) Graph.d3Force('link').distance(LAYOUT.linkDist).strength(0.22);
@@ -526,6 +544,27 @@ const data = {"nodes":[],"links":[]};
     .nodeVisibility(o=>nodeVis(byId.get(o.id))).linkVisibility(linkVis).linkColor(linkColorOf).linkWidth(linkWidthOf).linkDirectionalParticles(Graph.linkDirectionalParticles()); }
   function focusOn(id){ focusId=id; focusPulse=0; focusPulseStart=Date.now(); recomputeHops(); showDetail(id); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); }
 
+  // ---- temporal drill-down: expand a chronicle into a ring of its evidence facts ----
+  function collapseChronicle(){ if(expandedChron==null){ expandedSet=new Set(); return; }
+    const gd=Graph?Graph.graphData().nodes:[]; const em=new Map(gd.map(o=>[o.id,o]));
+    for(const id of expandedSet){ const o=em.get(id); if(o){ o.fx=undefined; o.fy=undefined; o.fz=undefined; } }
+    expandedChron=null; expandedSet=new Set(); refresh(); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation();
+    setTimeout(function(){ try{ Graph.zoomToFit(700,70); }catch(_){} }, 120); }
+  function toggleChronicle(id){ if(expandedChron===id){ collapseChronicle(); return; }
+    if(expandedChron!=null) collapseChronicle();
+    const c=byId.get(id), ev=chronEvidence.get(id)||[];
+    expandedChron=id; expandedSet=new Set(ev.map(f=>f.id));
+    if(c && ev.length && Graph){
+      const gd=Graph.graphData().nodes; const em=new Map(gd.map(o=>[o.id,o]));
+      const cx=(c._tx!=null?c._tx:0), cy=(c._ty!=null?c._ty:0), k=ev.length;
+      // even spacing on a single ring; radius grows with count so nodes never crowd.
+      const R=Math.max(46, 16*k/(2*Math.PI));
+      ev.forEach((f,i)=>{ const o=em.get(f.id); if(!o) return; const th=(i/k)*Math.PI*2 - Math.PI/2;
+        const x=cx+R*Math.cos(th), y=cy+R*Math.sin(th); o.fx=x; o.fy=y; o.fz=0; o.x=x; o.y=y; o.z=0; });
+    }
+    refresh(); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation();
+    setTimeout(function(){ try{ Graph.zoomToFit(700,80); }catch(_){} }, 140); }
+
   // ---- camera helpers ----
   function camTarget(){ const c=Graph&&Graph.controls(); return c&&c.target?c.target:{x:0,y:0,z:0}; }
   function dolly(f){ if(!Graph)return; const cam=Graph.camera(), t=camTarget();
@@ -536,7 +575,7 @@ const data = {"nodes":[],"links":[]};
     const ce=Math.cos(el); cam.position.x=t.x+r*ce*Math.sin(az); cam.position.y=t.y+r*Math.sin(el); cam.position.z=t.z+r*ce*Math.cos(az);
     cam.lookAt(t); const c=Graph.controls(); c&&c.update&&c.update(); lastInteract=Date.now(); pauseRotate(); }
   function pauseRotate(){ const c=Graph&&Graph.controls(); if(c) c.autoRotate=false; }
-  function setRotate(on){ autoRotate=on; const c=Graph&&Graph.controls(); if(c) c.autoRotate=on && linkMode!=='temporal'; document.getElementById('rotateBtn').classList.toggle('on',on); if(on) lastInteract=0; }
+  function setRotate(on){ autoRotate=on; const c=Graph&&Graph.controls(); if(c) c.autoRotate=on; document.getElementById('rotateBtn').classList.toggle('on',on); if(on) lastInteract=0; }
   // OrbitControls dollies toward controls.target, which makes wheel zoom feel pinned to the
   // previously focused node. Scale both camera and target around the world-space point under
   // the pointer instead: that point remains under the cursor while zoom also becomes a natural
@@ -607,6 +646,7 @@ const data = {"nodes":[],"links":[]};
       ? 'Timeline — chronicles form the time axis (day→year); the facts each period summarizes group around it. Click a chronicle to reveal its evidence.'
       : 'Semantic axis — meaning links; year-reference hubs hidden.';
     focusId=null; hideDetail(); search.value=''; hitCountEl.textContent='';
+    expandedChron=null; expandedSet=new Set();
     applyTimeline(m==='temporal');
     recomputeHops(); refreshStats(); }
   document.getElementById('modeSem').onclick=()=>setLinkMode('semantic');
@@ -648,7 +688,7 @@ const data = {"nodes":[],"links":[]};
         focusPulse=eased; if(Graph.linkWidth) Graph.linkWidth(linkWidthOf).linkColor(linkColorOf);
         if(p>=1) focusPulseStart=0; }
       // resume auto-rotate after 4s idle
-      if(autoRotate && linkMode!=='temporal'){ const c=Graph.controls(); if(c && !c.autoRotate && Date.now()-lastInteract>4000) c.autoRotate=true; }
+      if(autoRotate){ const c=Graph.controls(); if(c && !c.autoRotate && Date.now()-lastInteract>4000) c.autoRotate=true; }
       // AUTO LABELS: score nodes that are visible, in front of camera, and on-screen; label the most important.
       const cam=Graph.camera(); const gd=Graph.graphData().nodes;
       const Wp=elGraph.clientWidth||900, Hp=elGraph.clientHeight||760;
