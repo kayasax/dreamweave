@@ -558,9 +558,12 @@ const data = {"nodes":[],"links":[]};
       const gd=Graph.graphData().nodes; const em=new Map(gd.map(o=>[o.id,o]));
       const cx=(c._tx!=null?c._tx:0), cy=(c._ty!=null?c._ty:0), k=ev.length;
       // even spacing on a single ring; radius grows with count so nodes never crowd.
+      // The chronicle time axis runs along X, so the ring lives in the Y-Z plane (its normal is
+      // the time axis) — the evidence fans out perpendicular to the timeline instead of smearing
+      // along it and overlapping neighbouring chronicles.
       const R=Math.max(46, 16*k/(2*Math.PI));
       ev.forEach((f,i)=>{ const o=em.get(f.id); if(!o) return; const th=(i/k)*Math.PI*2 - Math.PI/2;
-        const x=cx+R*Math.cos(th), y=cy+R*Math.sin(th); o.fx=x; o.fy=y; o.fz=0; o.x=x; o.y=y; o.z=0; });
+        const x=cx, y=cy+R*Math.cos(th), z=R*Math.sin(th); o.fx=x; o.fy=y; o.fz=z; o.x=x; o.y=y; o.z=z; });
     }
     refresh(); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation();
     setTimeout(function(){ try{ Graph.zoomToFit(700,80); }catch(_){} }, 140); }
