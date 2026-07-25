@@ -356,6 +356,12 @@ function removeDependentChronicles(db, evidenceSig) {
 const degreeMap = (db) => {
   const d = new Map();
   for (const e of db.prepare("SELECT src, dst FROM edges").all()) { d.set(e.src, (d.get(e.src) || 0) + 1); d.set(e.dst, (d.get(e.dst) || 0) + 1); }
+  // Derived details remain connected through their authoritative gist lineage even
+  // when they do not need a separate semantic edge.
+  for (const e of db.prepare("SELECT detail_sig, gist_sig FROM detail_of").all()) {
+    d.set(e.detail_sig, (d.get(e.detail_sig) || 0) + 1);
+    d.set(e.gist_sig, (d.get(e.gist_sig) || 0) + 1);
+  }
   return d;
 };
 
