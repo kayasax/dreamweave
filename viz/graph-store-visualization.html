@@ -149,7 +149,7 @@ html[data-theme="dark"] #graph { background:
     <div class="labels" id="labels"></div>
     <div class="toolbar">
       <button class="tbtn on" id="modeSem" title="Semantic axis: meaning links (related_to / similar_to / mentions). Hides year-reference hubs.">◆ Semantic</button>
-      <button class="tbtn" id="modeTmp" title="Temporal axis: only sequence + supersedes — the lineages of how events evolved over time.">◷ Temporal</button>
+      <button class="tbtn" id="modeTmp" title="Temporal axis: the chronicle timeline, each period ringed by the facts it summarizes. Click a chronicle to bloom its ring open.">◷ Temporal</button>
       <span style="width:1px;align-self:stretch;background:var(--cp-border);margin:0 3px;"></span>
       <span class="small" style="align-self:center;margin-left:2px;">Edges:</span>
       <button class="tbtn" id="edgeAlways" title="Render every edge in the selected semantic or temporal axis">Always On</button>
@@ -232,8 +232,8 @@ const data = {"nodes":[],"links":[]};
   const isTemporalRel=r=>TEMPORAL_RELS.has(r);
   const isTimeRefHub=n=>n.kind==='entity'&&/^ref:(?:19|20)\d{2}(?:[-:]\d{1,2}){0,2}$/.test(n.id);
   let linkMode='semantic', edgeMode=rawLinks.length>1000?'hover':'always';
-  // temporal-mode chronicle drill-down: which chronicle (if any) is expanded, and the set of
-  // evidence-fact ids currently ringed around it. chronEvidence maps chronicle id -> [factNode].
+  // temporal-mode chronicle drill-down: which chronicle (if any) is bloomed open, and the set of
+  // evidence-fact ids currently pushed out to the wide ring. chronEvidence maps chronicle id -> [factNode].
   let expandedChron=null, expandedSet=new Set();
   const chronEvidence=new Map();
   const refHub=new Uint8Array(nodes.length);
@@ -293,10 +293,10 @@ const data = {"nodes":[],"links":[]};
   function nodeVis(n){ if(!passesFilter(n)) return false;
     if(linkMode==='semantic'){ if(refHub[n.idx]||n.kind==='chronicle') return false; return true; }
     if(refHub[n.idx]) return false;
-    // Temporal mode shows ONLY chronicle nodes by default. Clicking a chronicle reveals its
-    // supporting evidence facts as a ring around it (expandedSet); everything else stays hidden.
+    // Temporal mode is the timeline: every dated chronicle plus the ring of facts it summarizes.
+    // Clicking a chronicle blooms its ring outward (expandedSet) for a readable drill-down.
     if(n.kind==='chronicle') return !!n._thas;
-    if(n.kind==='fact') return expandedChron!=null && expandedSet.has(n.id);
+    if(n.kind==='fact') return !!n._thas || (expandedChron!=null && expandedSet.has(n.id));
     return false; }
   const avgCol=(a,b)=>{ const ca=baseColor(a),cb=baseColor(b); return [(ca[0]+cb[0])>>1,(ca[1]+cb[1])>>1,(ca[2]+cb[2])>>1]; };
   // In temporal mode a node with no sequence/supersedes edge is kept as faint background
@@ -436,24 +436,52 @@ const data = {"nodes":[],"links":[]};
   }
   try { computeHubLayout(); } catch(e){ console.error('hub layout failed, falling back to semantic projection', e); }
 
-  // ---- TIMELINE anchors (temporal-mode chronicle backbone + evidence bloom) ----
+  // ---- TIMELINE anchors (temporal-mode chronicle backbone + evidence rings) ----
   const RES_TIER={ day:0, week:1, month:2, quarter:3, year:4 };
+  // Every dated chronicle wears the facts it summarizes as CONCENTRIC RINGS lying in the plane
+  // perpendicular to the time axis (the Y-Z plane at x = the chronicle's time). Rings step
+  // outward and each holds as many facts as fit at RING_ARC spacing, so node density stays
+  // uniform whether a period summarizes 3 facts or 300 and the disc never smears along time.
+  const RING_R0=30, RING_DR=19, RING_ARC=18;
+  const ringCap=R=>Math.max(6,Math.round(2*Math.PI*R/RING_ARC));
+  function ringSlot(i){ for(let j=0,base=0;;j++){ const R=RING_R0+j*RING_DR, cap=ringCap(R);
+      if(i<base+cap) return { r:R, th:((i-base)/cap)*Math.PI*2 + (j%2?Math.PI/cap:0) };   // odd rings half-step: no spokes
+      base+=cap; } }
+  const discRadius=k=>k>0?ringSlot(k-1).r:0;                       // outer radius of a k-fact disc
+  const median=a=>{ if(!a.length) return 0; const s=a.slice().sort((x,y)=>x-y); return s[s.length>>1]; };
   (function computeTimeline(){
     const ep=d=>{ const t=Date.parse(d); return isNaN(t)?null:t/8.64e7; };
     let tmin=Infinity,tmax=-Infinity; const cT={};
     for(const n of nodes){ if(n.kind==='chronicle'&&n.ps){ const a=ep(n.ps), b=ep(n.pe||n.ps); if(a!=null){ const m=(a+(b!=null?b:a))/2; cT[n.id]=m; if(m<tmin)tmin=m; if(m>tmax)tmax=m; } } }
-    const XW=760, GAP=150, span=Math.max(1,tmax-tmin);
-    const tx=m=>((m-tmin)/span)*2*XW-XW;
-    for(const n of nodes){ if(n.kind==='chronicle'&&cT[n.id]!=null){ const tier=RES_TIER[n.res]||0;
-      n._tx=tx(cT[n.id]); n._ty=(tier-1.3)*GAP; n._tz=0; n._thas=1; n._pull=4.2; } else if(n.kind==='chronicle'){ n._thas=0; } }
-    // evidence: assign each fact to the FIRST chronicle it rolls up to, hang it below in a wisp
-    const owner={};
+    // Own each evidence fact by the FIRST dated chronicle it rolls up to, so every fact sits in
+    // exactly one ring even when day/week/month chronicles all summarize it.
+    const owned=new Map(), takenBy={};                             // chronicle id -> [fact nodes]
     for(const l of rawLinks){ if(l.rel!=='chronicle_evidence') continue;
       const a=byId.get(l.source), b=byId.get(l.target);
       const c=(a&&a.kind==='chronicle')?a:((b&&b.kind==='chronicle')?b:null);
-      const f=(a&&a.kind==='chronicle')?b:a; if(!c||!f||c._tx==null||f.kind!=='fact'||owner[f.id]!=null) continue;
-      owner[f.id]=c.id; (c._ecount=(c._ecount||0)); const i=c._ecount++;
-      f._tx=c._tx+((i%2)?1:-1)*(6+4*i); f._ty=c._ty-40-20*i; f._tz=0; f._thas=1; f._pull=2.6; }
+      const f=(a&&a.kind==='chronicle')?b:a;
+      if(!c||!f||cT[c.id]==null||f.kind!=='fact'||takenBy[f.id]!=null) continue;
+      takenBy[f.id]=c.id; if(!owned.has(c.id)) owned.set(c.id,[]); owned.get(c.id).push(f); }
+    // Tier rows must clear the widest disc (adjacent tiers share the x range, so their discs are
+    // the only pair that can actually intersect); the time axis is then stretched so typical
+    // neighbours read as separate beads rather than one continuous tube.
+    let maxR=0; for(const arr of owned.values()) maxR=Math.max(maxR,discRadius(arr.length));
+    const GAP=Math.max(150, Math.round(maxR*2.3));
+    const XW=760, span=Math.max(1,tmax-tmin);
+    const tx0=m=>((m-tmin)/span)*2*XW-XW;
+    const tiers=new Map();
+    for(const n of nodes){ if(n.kind!=='chronicle'||cT[n.id]==null) continue;
+      const t=RES_TIER[n.res]||0; if(!tiers.has(t)) tiers.set(t,[]); tiers.get(t).push(n); }
+    const gaps=[], radii=[];
+    for(const arr of tiers.values()){ arr.sort((a,b)=>cT[a.id]-cT[b.id]);
+      for(const n of arr) radii.push(discRadius((owned.get(n.id)||[]).length));
+      for(let i=1;i<arr.length;i++){ const dx=Math.abs(tx0(cT[arr[i].id])-tx0(cT[arr[i-1].id])); if(dx>1e-6) gaps.push(dx); } }
+    const mg=median(gaps), xScale=mg?Math.min(3,Math.max(1,(median(radii)*2.2+18)/mg)):1;
+    for(const n of nodes){ if(n.kind==='chronicle'&&cT[n.id]!=null){ const tier=RES_TIER[n.res]||0;
+      n._tx=tx0(cT[n.id])*xScale; n._ty=(tier-1.3)*GAP; n._tz=0; n._thas=1; n._pull=4.2; } else if(n.kind==='chronicle'){ n._thas=0; } }
+    for(const [cid,arr] of owned){ const c=byId.get(cid); if(!c||!c._thas) continue;
+      arr.forEach((f,i)=>{ const s=ringSlot(i);
+        f._tx=c._tx; f._ty=c._ty+s.r*Math.cos(s.th); f._tz=s.r*Math.sin(s.th); f._thas=1; f._pull=2.6; }); }
     for(const n of nodes){ if(n.kind==='fact' && n._thas==null) n._thas=0; if(n.kind==='entity') n._thas=0; }
   })();
   // Map every chronicle -> its supporting evidence facts (chronicle_evidence links, either
@@ -467,28 +495,35 @@ const data = {"nodes":[],"links":[]};
     const arr=chronEvidence.get(c.id); if(!arr.some(x=>x.id===f.id)) arr.push(f); }
 
   // ---- TIMELINE <-> NEBULA transition ----
+  // Going temporal, every node that has a timeline slot (chronicles + their evidence rings) is
+  // flown to it and pinned, so the rings stay perfect circles instead of being puffed apart by
+  // charge. Coming back, the pins are dropped and the nebula anchors take over again.
   let _tlRAF=0;
   function applyTimeline(on){
     if(!Graph) return;
     const gd=Graph.graphData().nodes;
+    const anim=[];
     for(const o of gd){ const n=byId.get(o.id); if(!n) continue;
       if(on){
-        if(n.kind!=='chronicle' && n._thas){ o.ax=n._tx; o.ay=n._ty; o.az=0; o.fx=undefined; o.fy=undefined; o.fz=0; }
+        if(!n._thas) continue;
+        const tx=n._tx, ty=n._ty, tz=n._tz||0;
+        o.ax=tx; o.ay=ty; o.az=tz;
+        anim.push({ o:o, tx:tx, ty:ty, tz:tz, sx:(o.x==null?tx:o.x), sy:(o.y==null?ty:o.y), sz:(o.z==null?tz:o.z) });
       } else {
         o.fx=undefined; o.fy=undefined; o.fz=undefined;
-        if(n._px!=null){ o.ax=n._px*LAYOUT.xs; o.ay=n._py*LAYOUT.ys; o.az=n._pz*LAYOUT.zs; }
+        // the nebula anchors live on the GRAPH-DATA node (o._px/_py/_pz), not the raw node
+        if(o._px!=null){ o.ax=o._px*LAYOUT.xs; o.ay=o._py*LAYOUT.ys; o.az=o._pz*LAYOUT.zs; o.vx=o.vy=o.vz=0; }
       } }
     try { if(Graph.d3Force('link')) Graph.d3Force('link').strength(on?0.02:0.22); } catch(_){}
     try { if(Graph.d3Force('charge')) Graph.d3Force('charge').strength(on?-7:-LAYOUT.charge); } catch(_){}
     const ctrl=Graph.controls(); if(ctrl){ ctrl.enableRotate=true; ctrl.autoRotate=autoRotate; }
     cancelAnimationFrame(_tlRAF);
     if(on){
-      const chr=[]; for(const o of gd){ const n=byId.get(o.id); if(n&&n.kind==='chronicle'&&n._thas){ chr.push({o:o, tx:n._tx, ty:n._ty, sx:(o.x==null?n._tx:o.x), sy:(o.y==null?n._ty:o.y), sz:(o.z==null?0:o.z)}); } }
       const T=950, t0=performance.now();
       (function step(){ if(linkMode!=='temporal') return; const k=Math.min(1,(performance.now()-t0)/T); const e=k<0.5?2*k*k:1-Math.pow(-2*k+2,2)/2;
-        for(const c of chr){ const x=c.sx+(c.tx-c.sx)*e, y=c.sy+(c.ty-c.sy)*e, z=c.sz+(0-c.sz)*e; c.o.fx=x; c.o.fy=y; c.o.fz=z; c.o.x=x; c.o.y=y; c.o.z=z; }
+        for(const c of anim){ const x=c.sx+(c.tx-c.sx)*e, y=c.sy+(c.ty-c.sy)*e, z=c.sz+(c.tz-c.sz)*e; c.o.fx=x; c.o.fy=y; c.o.fz=z; c.o.x=x; c.o.y=y; c.o.z=z; }
         if(Graph.d3ReheatSimulation) Graph.d3ReheatSimulation();
-        if(k<1){ _tlRAF=requestAnimationFrame(step); } else { for(const c of chr){ c.o.fx=c.tx; c.o.fy=c.ty; c.o.fz=0; }
+        if(k<1){ _tlRAF=requestAnimationFrame(step); } else { for(const c of anim){ c.o.fx=c.tx; c.o.fy=c.ty; c.o.fz=c.tz; }
           try{ Graph.cameraPosition({x:0,y:0,z:900},{x:0,y:0,z:0},0); setTimeout(function(){ try{ Graph.zoomToFit(900,70);}catch(_){}},90); }catch(_){} }
       })();
       if(Graph.d3ReheatSimulation) Graph.d3ReheatSimulation();
@@ -544,10 +579,14 @@ const data = {"nodes":[],"links":[]};
     .nodeVisibility(o=>nodeVis(byId.get(o.id))).linkVisibility(linkVis).linkColor(linkColorOf).linkWidth(linkWidthOf).linkDirectionalParticles(Graph.linkDirectionalParticles()); }
   function focusOn(id){ focusId=id; focusPulse=0; focusPulseStart=Date.now(); recomputeHops(); showDetail(id); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation(); }
 
-  // ---- temporal drill-down: expand a chronicle into a ring of its evidence facts ----
+  // ---- temporal drill-down: bloom a chronicle's evidence ring outward for a closer read ----
+  const RING_EXPAND=2.4;
   function collapseChronicle(){ if(expandedChron==null){ expandedSet=new Set(); return; }
     const gd=Graph?Graph.graphData().nodes:[]; const em=new Map(gd.map(o=>[o.id,o]));
-    for(const id of expandedSet){ const o=em.get(id); if(o){ o.fx=undefined; o.fy=undefined; o.fz=undefined; } }
+    // settle each fact back onto its own default ring slot (it stays visible), not into free space
+    for(const id of expandedSet){ const o=em.get(id); if(!o) continue; const n=byId.get(id);
+      if(linkMode==='temporal' && n && n._thas){ o.fx=n._tx; o.fy=n._ty; o.fz=n._tz||0; o.x=o.fx; o.y=o.fy; o.z=o.fz; }
+      else { o.fx=undefined; o.fy=undefined; o.fz=undefined; } }
     expandedChron=null; expandedSet=new Set(); refresh(); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation();
     setTimeout(function(){ try{ Graph.zoomToFit(700,70); }catch(_){} }, 120); }
   function toggleChronicle(id){ if(expandedChron===id){ collapseChronicle(); return; }
@@ -556,14 +595,13 @@ const data = {"nodes":[],"links":[]};
     expandedChron=id; expandedSet=new Set(ev.map(f=>f.id));
     if(c && ev.length && Graph){
       const gd=Graph.graphData().nodes; const em=new Map(gd.map(o=>[o.id,o]));
-      const cx=(c._tx!=null?c._tx:0), cy=(c._ty!=null?c._ty:0), k=ev.length;
-      // even spacing on a single ring; radius grows with count so nodes never crowd.
-      // The chronicle time axis runs along X, so the ring lives in the Y-Z plane (its normal is
-      // the time axis) — the evidence fans out perpendicular to the timeline instead of smearing
-      // along it and overlapping neighbouring chronicles.
-      const R=Math.max(46, 16*k/(2*Math.PI));
-      ev.forEach((f,i)=>{ const o=em.get(f.id); if(!o) return; const th=(i/k)*Math.PI*2 - Math.PI/2;
-        const x=cx, y=cy+R*Math.cos(th), z=R*Math.sin(th); o.fx=x; o.fy=y; o.fz=z; o.x=x; o.y=y; o.z=z; });
+      const cx=(c._tx!=null?c._tx:0), cy=(c._ty!=null?c._ty:0);
+      // Same concentric-ring geometry as the resting layout, scaled up: the disc keeps its shape
+      // (and stays perpendicular to the time axis, so it never smears over neighbouring periods)
+      // while opening enough room to read the labels. Includes evidence owned by another
+      // chronicle's ring — the drill-down shows everything this period summarizes.
+      ev.forEach((f,i)=>{ const o=em.get(f.id); if(!o) return; const s=ringSlot(i), R=s.r*RING_EXPAND;
+        const x=cx, y=cy+R*Math.cos(s.th), z=R*Math.sin(s.th); o.fx=x; o.fy=y; o.fz=z; o.x=x; o.y=y; o.z=z; });
     }
     refresh(); if(Graph&&Graph.d3ReheatSimulation) Graph.d3ReheatSimulation();
     setTimeout(function(){ try{ Graph.zoomToFit(700,80); }catch(_){} }, 140); }
@@ -646,7 +684,7 @@ const data = {"nodes":[],"links":[]};
     document.getElementById('modeSem').classList.toggle('on',m==='semantic');
     document.getElementById('modeTmp').classList.toggle('on',m==='temporal');
     document.getElementById('hint').textContent = m==='temporal'
-      ? 'Timeline — chronicles form the time axis (day→year); the facts each period summarizes group around it. Click a chronicle to reveal its evidence.'
+      ? 'Timeline — chronicles form the time axis (day→year), each ringed by the facts it summarizes. Click a chronicle to bloom its ring open.'
       : 'Semantic axis — meaning links; year-reference hubs hidden.';
     focusId=null; hideDetail(); search.value=''; hitCountEl.textContent='';
     expandedChron=null; expandedSet=new Set();
