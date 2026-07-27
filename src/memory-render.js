@@ -140,9 +140,9 @@ function renderChronicleEnvelope(db, node, opts = {}) {
     lines.push(`- ${entry.slot_label}${state}${aspect}: ${compact(entry.summary, opts.maxEntryChars)}`);
   }
   if (omitted) lines.push(`- ... ${omitted} intermediate ${omitted === 1 ? "entry" : "entries"} omitted from this projection`);
-  lines.push("",
-    `Evidence coverage: ${meta.covered_event_count} linked ${meta.covered_event_count === 1 ? "item" : "items"}`,
-    `Compression level: ${meta.compression_level}`);
+  // No coverage/compression footer: both are exact counts already held in `chronicles` and
+  // `chronicle_evidence`, recomputable with one query. Spending a projected memory's budget
+  // restating them displaces the named specifics that make the period findable.
   return lines.join("\n");
 }
 

@@ -266,27 +266,58 @@ Two nodes are linkable when they **share a referent**. Signals, in priority:
    - **chronicles** — the **temporal axis**: roll each SETTLED time period (day, then coarser week/
      month/quarter/year as it ages) into ONE fixed-period overview plus an ordered list of what changed,
      every claim backed by dated evidence already in the db. Run this LAST (after merges/synthesis) so it
-     summarizes consolidated facts over resolved entities. Chronicles never invent content — they index
-     existing dated evidence into a period-bound timeline the caller can recall via `recall.js --timeline`.
+     summarizes consolidated facts over resolved entities. Chronicles never invent content — they distill
+     existing dated evidence into a period-bound account the caller can recall via `recall.js --timeline`.
      report: `{surface:"chronicles", report_id, basis_seq, candidates:[{periodId, resolution, periodStart, periodEnd, nextVersion, coverageSeq, members:[{sig, kind, fact, sourceDay, periodStart, periodEnd, entitySigs}]}]}`
      `candidates[]` is bounded to newly-closeable/re-coverable periods; `members[]` are the dated evidence
-     facts (and, for coarser periods, the finer child chronicles) that fall in the window — the ONLY sigs
-     you may cite. `entitySigs` on a member are the caller-approved entity hubs it mentions.
-     judge: for each candidate write ONE `summary` (≥8 chars: the period's net state/arc) and an ordered
-     `entries[]` timeline. Each entry = a `slot` label (e.g. "morning"/"week 1"/an event marker), a
-     `summary` (≥4 chars) of what happened, a `changeKind ∈ {continuity, introduced, changed, resolved,
-     reversed, completed}`, optional `stateLabel`/`aspect`, optional `entitySigs` (subset of the members'
-     approved entities), and `evidenceSigs` (≥1, all drawn from THIS candidate's `members`). **Coverage is
-     mandatory and complete**: every member sig MUST appear in some entry's `evidenceSigs`, or the period is
-     rejected (`incomplete_coverage`). Decide EVERY candidate in the report — a period neither decided nor
-     otherwise handled is rejected `period_missing`. Never invent sigs, periods, entities, dates, or entries.
+     facts (and, for coarser periods, the finer child chronicles **in full**) that fall in the window — the
+     ONLY sigs you may cite. `entitySigs` on a member are the caller-approved entity hubs it mentions.
+
+     judge: for each candidate write ONE `summary` and an ordered `entries[]` timeline.
+
+     **`summary` is the period's retrieval surface.** It is embedded and later matched against
+     natural-language questions — *"what happened around \<date\>"*, *"what changed with X"*,
+     *"when did X first come up"*. Write the sentences those questions will land on:
+     - **Name things.** Use the actual people, systems, artifacts and outcomes as they appear in the
+       members' text; the members' `entitySigs` hubs are the approved vocabulary. Questions are asked in
+       the words of the subject matter, never in the words of the bookkeeping.
+     - **Record transitions with their subject** — what began, finished, reversed, or is still open,
+       always attached to *what it was about*.
+     - **Record firsts.** The first appearance of a person, system, or thread in this period is what
+       answers *"when did X first happen"*.
+     - **Say the period in words** ("Monday 22 July 2026") so date-phrased questions match.
+     - **Let length follow the period.** A dull day gets a short, concrete summary naming the little that
+       happened. There is no quota in either direction — never pad, never compress a busy day to fit.
+     - **Never write counts as content.** Coverage and compression are exact numbers already in
+       `chronicles`/`chronicle_evidence`, recomputable with one query, and they match no question anyone
+       asks. If a number matters, attach it to a named subject ("three separate OneIdentity approvals for
+       the Gateway release"). Never use `changeKind` values as prose.
+     - **Self-check before writing the decision:** name two or three questions someone would ask six
+       months from now to find this period. If the summary lacks the words of those questions, rewrite it.
+
+     For coarser periods the members ARE the child chronicles, supplied in full. Carry their named
+     specifics upward, selecting what still matters at this resolution — never aggregate them into totals.
+
+     Each `entries[]` entry = a `slot` label that marks *when or at what event* within the period
+     ("morning", "week 1", "after the incident") — NOT a restatement of `changeKind` — a `summary`
+     (≥4 chars) of what happened, named the same way as above, a `changeKind ∈ {continuity, introduced,
+     changed, resolved, reversed, completed}`, optional `stateLabel`/`aspect`, optional `entitySigs`
+     (subset of the members' approved entities), and `evidenceSigs` (≥1, all drawn from THIS candidate's
+     `members`). **Coverage is mandatory and complete**: every member sig MUST appear in some entry's
+     `evidenceSigs`, or the period is rejected (`incomplete_coverage`). Coverage is a structural property
+     of the evidence links — satisfy it by attaching sigs to the entry they belong to, never by bucketing
+     everything into one entry per `changeKind`. Decide EVERY candidate in the report — a period neither
+     decided nor otherwise handled is rejected `period_missing`. Never invent sigs, periods, entities,
+     dates, or entries.
      decision: `{report_id, decisions:[{periodId, summary, entries:[{slot, summary, changeKind, stateLabel?, aspect?, entitySigs?, evidenceSigs:[...]}]}]}`
      Apply is **report-bound and atomic**: a stale/missing `report_id`, any malformed/duplicate/
      uncovered period, or any evidence/entity sig outside the candidate rejects the WHOLE apply
      (`complete:false`, structured `rejected`, zero mutation). Applied chronicles persist as
      `kind='chronicle'` nodes (with `chronicle_entries`/`chronicle_evidence`) that project to Tier 1 as
      `tier='chronicle'` temporal memories and recall through the `--timeline` axis; older fine periods
-     archive only once coarser coverage exists.
+     archive only once coarser coverage exists. `doctor` reports
+     `chronicle_vector_dispersion.mean_pairwise_cosine` — if it climbs toward 1.0 the summaries have
+     collapsed into interchangeable bookkeeping and the temporal axis has stopped discriminating periods.
 
    Apply commands validate/sanitize the decision, mutate the db, and re-weave / `repairGraph` as needed.
    **`apply-merges` is the load-bearing stage**: it creates the `notes='gist'` survivor **born

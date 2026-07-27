@@ -2739,9 +2739,14 @@ function chronicleBounds(resolution, day) {
   return null;
 }
 function latestChronicleRows(db, resolution, start, end) {
+  // Members of a coarser period ARE the finer chronicles, and this `fact` is the only text
+  // the judge ever sees for them. Truncating to the first line stripped every named specific
+  // out of the rollup input, so a week could say nothing more concrete than a count of its
+  // days' counts -- vagueness compounded by construction, and no prompt could recover it.
+  // Hand over the whole summary and let the judge select what still matters at this scale.
   return db.prepare(`
     SELECT n.signature sig,
-      CASE WHEN instr(n.fact,char(10))>0 THEN substr(n.fact,1,instr(n.fact,char(10))-1) ELSE n.fact END fact,
+      n.fact fact,
       n.notes,n.first_seen,c.*
     FROM chronicles c JOIN nodes n ON n.signature=c.node_sig
     WHERE c.resolution=? AND c.period_start>=? AND c.period_end<=?
@@ -3260,6 +3265,54 @@ async function budget(db) {
 }
 
 // ---- DOCTOR -----------------------------------------------------------------
+// Mean pairwise cosine across active day-chronicle vectors. A chronicle summary is the
+// retrieval surface for the temporal axis: it gets embedded and matched against questions
+// like "what happened around <date>" or "when did X first come up". When summaries
+// degenerate into bookkeeping ("42 tracked items - 22 open loops, 4 resolved"), every
+// period embeds to nearly the same point and the axis carries no signal -- a query that
+// matches one day matches them all. Ordinary facts disperse around ~0.37; chronicles above
+// CHRONICLE_DISPERSION_WARN are mutually indistinguishable. Reported, never gating: this is
+// a quality signal about authored text, not a structural defect doctor can repair.
+const CHRONICLE_DISPERSION_WARN = 0.9;
+function chronicleVectorDispersion(db, limit = 60) {
+  let rows;
+  try {
+    rows = db.prepare(`
+      SELECT v.embedding e
+      FROM chronicles c
+      JOIN nodes n ON n.signature=c.node_sig
+      JOIN vec_chronicles v ON v.rowid=n.id
+      WHERE c.resolution='day' AND coalesce(n.notes,'')<>'archive'
+      ORDER BY c.period_start DESC LIMIT ?
+    `).all(limit);
+  } catch { return null; }
+  // Buffers can sit at an unaligned byteOffset in a shared pool, so read floats explicitly.
+  const vecs = rows.map((r) => {
+    const f = new Float32Array(r.e.length / 4);
+    for (let i = 0; i < f.length; i += 1) f[i] = r.e.readFloatLE(i * 4);
+    return f;
+  });
+  if (vecs.length < 3) return null;
+  let sum = 0; let pairs = 0; let collapsed = 0;
+  for (let i = 0; i < vecs.length; i += 1) {
+    for (let j = i + 1; j < vecs.length; j += 1) {
+      const a = vecs[i]; const b = vecs[j];
+      let d = 0; let x = 0; let y = 0;
+      for (let k = 0; k < a.length; k += 1) { d += a[k] * b[k]; x += a[k] * a[k]; y += b[k] * b[k]; }
+      const cos = d / (Math.sqrt(x) * Math.sqrt(y) || 1);
+      sum += cos; pairs += 1;
+      if (cos > CHRONICLE_DISPERSION_WARN) collapsed += 1;
+    }
+  }
+  if (!pairs) return null;
+  const mean = sum / pairs;
+  return {
+    sampled: vecs.length,
+    mean_pairwise_cosine: Number(mean.toFixed(4)),
+    collapsed_pair_ratio: Number((collapsed / pairs).toFixed(3)),
+    degenerate: mean > CHRONICLE_DISPERSION_WARN,
+  };
+}
 function doctor(db) {
   const facts = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").get().c;
   const archived = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND notes='archive'").get().c;
@@ -3450,6 +3503,7 @@ function doctor(db) {
     stale_active_chronicle_versions: staleActiveChronicleVersions,
     chronicle_vector_mismatches: chronicleVectorMismatches,
     chronicle_dedicated_vector_mismatches: chronicleDedicatedVectorMismatches,
+    chronicle_vector_dispersion: chronicleVectorDispersion(db),
     avg_degree: edges ? Number((degsum / (facts + entities)).toFixed(2)) : 0,
     healthy,
   };
