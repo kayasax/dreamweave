@@ -107,11 +107,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" "${{ env.ZIP }}" \
-            --title "dreamweave ${GITHUB_REF_NAME}" \
-            --verify-tag \
-            --notes "Download **${{ env.ZIP }}** below, unzip it, and tell your OpenClaw/Scout (Clawpilot) agent to *import this* — it will detect \`INSTALL.md\` and set everything up (\`npm install && npm run setup\`, install the \`dream\` + \`graph-recall\` skills, then interview you on the five behavioral knobs).
+          NOTES="Download **${{ env.ZIP }}** below, unzip it, and tell your OpenClaw/Scout (Clawpilot) agent to *import this* — it will detect \`INSTALL.md\` and set everything up (\`npm install && npm run setup\`, install the \`dream\` + \`graph-recall\` skills, then interview you on the five behavioral knobs).
 
           **Prerequisites:** Node >= 18, and a toolchain that can build \`better-sqlite3\` (prebuilt binaries cover most platforms). First run downloads a small embedding model once, then works offline.
 
           Source-only by design: native deps are built by your \`npm install\`."
+
+          # A release may already exist when the tag was published by hand. Attaching the
+          # zip still has to happen, otherwise the release ships with no download at all —
+          # so upload into the existing release rather than failing the job. Hand-written
+          # notes are left alone; only the missing asset is filled in.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists — attaching ${{ env.ZIP }} to it."
+            gh release upload "${GITHUB_REF_NAME}" "${{ env.ZIP }}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "${{ env.ZIP }}" \
+              --title "dreamweave ${GITHUB_REF_NAME}" \
+              --verify-tag \
+              --notes "${NOTES}"
+          fi
+
+          # Guarantee the invariant the job exists to uphold: the release has its zip.
+          gh release view "${GITHUB_REF_NAME}" --json assets \
+            --jq '.assets[].name' | grep -qx "${{ env.ZIP }}"
+          echo "Verified ${{ env.ZIP }} is attached to ${GITHUB_REF_NAME}."
