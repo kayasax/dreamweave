@@ -166,6 +166,15 @@ function parseFlags(argv) {
   return f;
 }
 
+// apply-chronicles recomputes the report internally to bind the decision to a report_id, so
+// it MUST see the same flags the report was generated with or every period rejects as stale.
+const chronicleOpts = (flags) => ({
+  asOf: flags["as-of"],
+  resummarize: flags.resummarize,
+  resummarizeBefore: flags["resummarize-before"],
+  maxCandidates: flags["max-candidates"],
+});
+
 const nextId = (db) => db.prepare("SELECT COALESCE(MAX(id),0)+1 m FROM nodes").get().m;
 const getMeta = (db, k) => (db.prepare("SELECT value FROM meta WHERE key=?").get(k) || {}).value;
 const setMeta = (db, k, v) => db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)").run(k, v);
@@ -2791,6 +2800,22 @@ function chronicleCandidates(db, opts = {}) {
   const asOf = isoDay(opts.asOf || new Date().toISOString());
   if (!asOf) return [];
   const maxCandidates = Math.max(1, Number(opts.maxCandidates) || 32);
+  // Re-summarization: a period is normally reported once and then skipped forever, because
+  // its stored coverage_seq already covers every member. When the judging contract changes,
+  // the existing summaries are stale in a way no member edit will ever signal, so callers
+  // can reopen already-covered periods at one resolution. Scope it to a single resolution
+  // and work fine->coarse: a week's members are the day chronicles as they stand at report
+  // time, so the days must be rewritten and applied before the week is reported, or the
+  // rollup carries the old text upward.
+  const resummarize = opts.resummarize === true ? "*" : String(opts.resummarize || "");
+  if (resummarize && resummarize !== "*" && !CHRONICLE_RESOLUTIONS.includes(resummarize)) {
+    throw new Error(`resummarize must be one of ${CHRONICLE_RESOLUTIONS.join("|")} (got "${resummarize}")`);
+  }
+  // Watermark that makes re-summarization batchable. Without it every already-covered period
+  // reopens on every report, so a caller working through them `--max-candidates` at a time
+  // would be handed the same earliest periods forever. Pin one instant for the whole campaign:
+  // a period rewritten during the campaign gets a newer created_at and drops out of the report.
+  const resummarizeBefore = typeof opts.resummarizeBefore === "string" ? opts.resummarizeBefore : "";
   const periods = [];
   const sourceDays = db.prepare(`
     SELECT DISTINCT source_day day
@@ -2838,10 +2863,13 @@ function chronicleCandidates(db, opts = {}) {
     if (!rows.length) continue;
     const coverageSeq = Math.max(0, ...rows.map((r) => Number(r.coverageSeq) || 0));
     const current = db.prepare(`
-      SELECT max(version) version,max(coverage_seq) coverage_seq
+      SELECT max(version) version,max(coverage_seq) coverage_seq,max(created_at) created_at
       FROM chronicles WHERE resolution=? AND period_start=? AND period_end=?
     `).get(period.resolution, period.start, period.end);
-    if (current && Number(current.version) > 0 && Number(current.coverage_seq) >= coverageSeq) continue;
+    const covered = current && Number(current.version) > 0 && Number(current.coverage_seq) >= coverageSeq;
+    const reopen = (resummarize === "*" || resummarize === period.resolution)
+      && (!resummarizeBefore || String((current && current.created_at) || "") < resummarizeBefore);
+    if (covered && !reopen) continue;
     const entitiesBySig = chronicleEntitiesForMembers(db, rows);
     const members = rows.map((r) => ({
       sig: r.sig,
@@ -3801,8 +3829,7 @@ function configCmd(argv) {
 
 async function main() {
   const cmd = process.argv[2];
-  const flags = parseFlags(process.argv);
-  const db = openDb();
+  const flags = parseFlags(process.argv);  const db = openDb();
   try {
     let r, gate = false;
     if (cmd === "init") r = { initialized: true, db: DB_PATH, data_dir: DATA_DIR };
@@ -3829,8 +3856,8 @@ async function main() {
     else if (cmd === "apply-merges") { r = await applyMerges(db, readDecisionFile(flags.file), { asOf: flags["as-of"], sim: Number(flags.sim) || 0 }); gate = r.complete === false; }
     else if (cmd === "report-synthesis") r = reportSynthesis(db, { asOf: flags["as-of"] });
     else if (cmd === "apply-synthesis") { r = await applySynthesis(db, readDecisionFile(flags.file), { asOf: flags["as-of"] }); gate = r.complete === false; }
-    else if (cmd === "report-chronicles") r = reportChronicles(db, { asOf: flags["as-of"] });
-    else if (cmd === "apply-chronicles") { r = await applyChronicles(db, readDecisionFile(flags.file), { asOf: flags["as-of"] }); gate = r.complete === false; }
+    else if (cmd === "report-chronicles") r = reportChronicles(db, chronicleOpts(flags));
+    else if (cmd === "apply-chronicles") { r = await applyChronicles(db, readDecisionFile(flags.file), chronicleOpts(flags)); gate = r.complete === false; }
     else if (cmd === "apply-concept") { const g = JSON.parse(fs.readFileSync(flags.file, "utf8")); r = await applyConcept(db, g, { asOf: flags["as-of"] }); repairGraph(db); }
     else if (cmd === "budget") r = await budget(db);
     else if (cmd === "doctor") { r = doctor(db); gate = !r.healthy; }
@@ -3859,6 +3886,7 @@ module.exports = {
   reportSalience,
   reportSynthesis,
   reportChronicles,
+  chronicleOpts,
   applyEntities,
   applyAliases,
   applyMerges,
