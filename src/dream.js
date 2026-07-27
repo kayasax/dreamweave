@@ -3584,7 +3584,12 @@ function recordProjection(db, file) {
 }
 
 function exportViz(db) {
-  const nodes = db.prepare("SELECT signature AS id, COALESCE(kind,'fact') kind, class, COALESCE(salience_score,0) salience_score, strength, reactivations, notes, memory_id, fact FROM nodes ORDER BY id").all();
+  // Tier-3 archive is inert: it is recallable by explicit keyword lookup but must never be
+  // rendered. Superseded chronicle versions (v1, v2, ... of the same period) are archived
+  // this way, and attachChronicles already filters them out of its metadata query — so
+  // without the same predicate here they survive as phantom nodes carrying no period
+  // window, dragging duplicate evidence links into the force layout.
+  const nodes = db.prepare("SELECT signature AS id, COALESCE(kind,'fact') kind, class, COALESCE(salience_score,0) salience_score, strength, reactivations, notes, memory_id, fact FROM nodes WHERE notes IS NULL OR notes NOT LIKE '%archive%' ORDER BY id").all();
   const proj = projectEmbeddings3D(db);
   for (const n of nodes) { const p = proj.get(n.id); if (p) { n.px = p[0]; n.py = p[1]; n.pz = p[2]; } }
   const ids = new Set(nodes.map((n) => n.id));
