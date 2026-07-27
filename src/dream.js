@@ -1295,7 +1295,10 @@ async function weave(db, opts) {
   const toks = (s) => new Set(L.normalize(s || "").split(" ").filter((w) => w.length > 4 && !L.isSignatureStopword(w)));
   const jaccard = (a, b) => { if (!a.size || !b.size) return 0; let i = 0; for (const x of a) if (b.has(x)) i++; return i / (a.size + b.size - i); };
   const scopeOf = (s) => { const m = String(s || "").match(/^\s*\[([^\]]{1,40})\]/); return m ? L.normalize(m[1]) : ""; };
-  const subjFull = db.prepare("SELECT id, signature, fact, first_seen, strength, class, notes, last_reactivated FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
+  // dirty_seq MUST be in this SELECT list: isToWeave gates on n.dirty_seq, so omitting the
+  // column makes it undefined -> Number(undefined)||0 -> 0, which never exceeds a persisted
+  // lastWeaveSeq. That silently empties subjSource on any mature db (see incremental-lineage.test.js).
+  const subjFull = db.prepare("SELECT id, signature, fact, first_seen, strength, class, notes, last_reactivated, dirty_seq FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
   const subjBySig = new Map(subjFull.map((r) => [r.signature, r]));
   // Entity-hub corpus frequency. A genuine same-subject restatement shares a SPECIFIC entity
   // (a named person/account/project that tags few facts), NOT a generic scope/role tag
