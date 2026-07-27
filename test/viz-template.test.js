@@ -29,4 +29,23 @@ if (!html.includes("if(n.kind==='fact') return !!n._thas ||")) {
   throw new Error("temporal mode must render all supporting-fact rings by default");
 }
 
+// Chronicles are to the temporal view what entities are to the semantic one, so both wear the
+// neutral backbone color. A per-resolution hue ramp put chronicles in the same pink family as
+// semantic facts, which made the spine disappear into the rings it summarizes; resolution is
+// carried by RES_SIZE instead.
+if (!html.includes("const baseColor=n=> (n.kind==='chronicle'||n.kind==='entity')?PAL.entity:")) {
+  throw new Error("chronicle nodes must share the entity backbone color");
+}
+if (/RES_COLOR/.test(html)) {
+  throw new Error("RES_COLOR reintroduces a chronicle hue ramp that competes with the fact classes");
+}
+if (!html.includes("const RES_SIZE=")) {
+  throw new Error("resolution must stay legible through RES_SIZE once the hue ramp is gone");
+}
+// The chronicle->chronicle spine follows the nodes it joins, so it must not fall back to a
+// fact-class color; evidence stays the faintest of the three temporal link families.
+if (!html.includes("l.rel==='next_period'?PAL.entity:")) {
+  throw new Error("the next_period spine must use the backbone color");
+}
+
 console.log("PASS \u2713 visualization template compiles with adaptive edge modes");

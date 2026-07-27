@@ -135,7 +135,7 @@ html[data-theme="dark"] #graph { background:
         <span><i id="lg-semantic"></i>semantic</span>
         <span><i id="lg-episodic"></i>episodic</span>
         <span><i id="lg-entity"></i>entity</span>
-        <span><i style="background:#d94f74"></i>chronicle</span>
+        <span><i id="lg-chronicle"></i>chronicle</span>
       </div>
     </div>
     <div>
@@ -196,12 +196,15 @@ const data = {"nodes":[],"links":[]};
   const BG=hexToRgb(css('--cp-scene2')||'#02020a');
   const _isDark=document.documentElement.getAttribute('data-theme')==='dark';
   const PAL={ salient:hexToRgb(css('--cp-warning')), semantic:hexToRgb(css('--cp-accent')), episodic:hexToRgb(css('--cp-link')), entity:(_isDark?[240,242,248]:[20,20,20]) };
-  const RES_COLOR={ day:hexToRgb('#f4a6b8'), week:hexToRgb('#ea7a95'), month:hexToRgb('#d94f74'), quarter:hexToRgb('#b52d55'), year:hexToRgb('#8a1638') };
   const RES_SIZE={ day:3.4, week:6, month:9.5, quarter:13, year:17 };
-  ['salient','semantic','episodic','entity'].forEach(k=>{ const el=document.getElementById('lg-'+k); if(el) el.style.background='rgb('+PAL[k].join(',')+')'; });
+  ['salient','semantic','episodic','entity','chronicle'].forEach(k=>{ const el=document.getElementById('lg-'+k); if(el) el.style.background='rgb('+(k==='chronicle'?PAL.entity:PAL[k]).join(',')+')'; });
   const mix=(c,t)=>'rgb('+c.map((v,i)=>Math.round(v+(BG[i]-v)*t)).join(',')+')';
   const rgbStr=c=>'rgb('+c.join(',')+')';
-  const baseColor=n=> n.kind==='chronicle'?(RES_COLOR[n.res]||PAL.salient):(n.kind==='entity'?PAL.entity:(PAL[n.cls]||PAL.semantic));
+  // Chronicles carry the temporal view the way entities carry the semantic one, so they wear
+  // the same neutral backbone color. Resolution (day -> week -> month -> quarter -> year) stays
+  // legible through RES_SIZE, which spans 3.4 -> 17 and reads more clearly than a hue ramp would
+  // against the pink/blue fact classes it used to compete with.
+  const baseColor=n=> (n.kind==='chronicle'||n.kind==='entity')?PAL.entity:(PAL[n.cls]||PAL.semantic);
 
   const elGraph=document.getElementById('graph'), elLabels=document.getElementById('labels'), elErr=document.getElementById('err');
   const search=document.getElementById('search'), hitCountEl=document.getElementById('hitCount');
@@ -334,8 +337,11 @@ const data = {"nodes":[],"links":[]};
     if(edgeMode==='hover'&&hoverId!=null&&linkIncidentFocus(l)) return 'rgba('+GOLD[0]+','+GOLD[1]+','+GOLD[2]+',0.92)';
     if(focusPulse>0 && linkIncidentFocus(l)) return 'rgba('+GOLD[0]+','+GOLD[1]+','+GOLD[2]+','+(0.5+0.45*focusPulse).toFixed(3)+')';
     if(linkMode==='temporal'){ if(l.rel==='chronicle_evidence') return mix(PAL.entity,0.55);
-      if(l.rel==='rollup') return mix(PAL.semantic,0.35);
-      const base=l.rel==='next_period'?PAL.semantic:(l.rel==='supersedes'?PAL.salient:PAL.episodic);
+      // next_period and rollup join one chronicle to another, so the spine wears the same
+      // neutral backbone color as the nodes it connects; evidence stays the faintest of the
+      // three so the structure reads above the ring it summarizes.
+      if(l.rel==='rollup') return mix(PAL.entity,0.3);
+      const base=l.rel==='next_period'?PAL.entity:(l.rel==='supersedes'?PAL.salient:PAL.episodic);
       if(hop!==null){ const hit=hop[a.idx]===0||hop[b.idx]===0; return mix(base, hit?0.0:0.4); }
       return mix(base,0.12); }
     const col=avgCol(a,b);
