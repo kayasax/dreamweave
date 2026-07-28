@@ -395,11 +395,12 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
   // `ex` row is mutated on each write so a later duplicate memory_id sees prior tx state,
   // preserving the old transaction-visibility semantics.
   const exByMem = new Map();
-  for (const r of db.prepare("SELECT id, memory_id, fact, salience, notes, first_seen, source_day FROM nodes WHERE memory_id<>'' AND memory_id<>'live' ORDER BY id").all()) {
+  for (const r of db.prepare("SELECT id, memory_id, kind, fact, salience, notes, first_seen, source_day FROM nodes WHERE memory_id<>'' AND memory_id<>'live' ORDER BY id").all()) {
     if (!exByMem.has(r.memory_id)) exByMem.set(r.memory_id, r);
   }
   const delVec = db.prepare("DELETE FROM vec_nodes WHERE rowid=?");
   const updChanged = db.prepare("UPDATE nodes SET fact=?, salience=?, text='', notes=CASE WHEN notes='archive' THEN NULL ELSE notes END, dirty_seq=? WHERE id=?");
+  const updChangedKeepNotes = db.prepare("UPDATE nodes SET fact=?, salience=?, text='', dirty_seq=? WHERE id=?");
   const updRevive = db.prepare("UPDATE nodes SET salience=?, notes=NULL, dirty_seq=? WHERE id=?");
   const updSal = db.prepare("UPDATE nodes SET salience=? WHERE id=?");
   const updFirstSeen = db.prepare("UPDATE nodes SET first_seen=?, source_day=?, dirty_seq=? WHERE id=?");
@@ -458,6 +459,12 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
           res.backfilled += 1;
         }
         const newFact = fact || ex.fact;
+        // Chronicles are ENGINE-OWNED and signature-first (chronicle:<res>:<period>:v<n>): the db
+        // is their source of truth, not the harness. A superseded version still sitting in the
+        // harness is projection lag, not user re-confirmation, so it must NOT be revived — doing
+        // so makes it unforgettable (revive -> export re-emits -> projection keeps it -> next
+        // ingest revives it again) and duplicates the period against its own newer version.
+        const engineOwned = ex.kind === "chronicle";
         if (newFact !== ex.fact) {
           // BUG-FIX: text changed for an existing memory — its stored vector is now stale.
           // Drop the vec row + text so the nightly embed-missing re-embeds it (keeps
@@ -465,9 +472,11 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
           // the active tier: re-ingestion by the source of truth is a strong reactivation
           // signal, so it earns its way out of the keyword-only bookshelf.
           delVec.run(BigInt(ex.id));
-          updChanged.run(newFact, category, changedSeq(), ex.id);
-          ex.fact = newFact; ex.salience = category; if (ex.notes === "archive") ex.notes = null;
-        } else if (ex.notes === "archive") {
+          if (engineOwned) updChangedKeepNotes.run(newFact, category, changedSeq(), ex.id);
+          else updChanged.run(newFact, category, changedSeq(), ex.id);
+          ex.fact = newFact; ex.salience = category;
+          if (!engineOwned && ex.notes === "archive") ex.notes = null;
+        } else if (ex.notes === "archive" && !engineOwned) {
           // re-confirmed but text unchanged: still revive from archive (re-embed via missing).
           updRevive.run(category, changedSeq(), ex.id);
           ex.salience = category; ex.notes = null;
@@ -3590,12 +3599,22 @@ function exportHarness(db, asOf) {
   const episodic = facts.filter((n) => !isGist(n))
     .sort((a, b) => (Date.parse(a.first_seen || "") || 0) - (Date.parse(b.first_seen || "") || 0) || a.signature.localeCompare(b.signature));
   const chronicleRows = db.prepare(`
-    SELECT n.*,c.resolution,c.period_start,c.period_end,c.compression_level
+    SELECT n.*,c.resolution,c.period_start,c.period_end,c.compression_level,c.version
     FROM nodes n JOIN chronicles c ON c.node_sig=n.signature
     WHERE n.kind='chronicle' AND coalesce(n.notes,'')<>'archive'
   `).all();
+  // A period has exactly ONE current chronicle. Re-summarizing writes a new version and the
+  // prior head is archived, but archive state is bookkeeping that other paths can disturb —
+  // so enforce the invariant here rather than trusting it. Without this, a period projects
+  // twice: its stale text next to its replacement.
+  const headByPeriod = new Map();
+  for (const n of chronicleRows) {
+    const key = `${n.resolution}:${n.period_start}:${n.period_end}`;
+    const cur = headByPeriod.get(key);
+    if (!cur || (Number(n.version) || 0) > (Number(cur.version) || 0)) headByPeriod.set(key, n);
+  }
   const desiredResolution = (age) => age <= 14 ? "day" : age <= 90 ? "week" : age <= 730 ? "month" : age <= 1460 ? "quarter" : "year";
-  const chronicle = chronicleRows
+  const chronicle = [...headByPeriod.values()]
     .filter((n) => {
       const age = Math.max(0, (nowRef.getTime() - Date.parse(`${n.period_end}T23:59:59Z`)) / dayMs);
       return n.resolution === desiredResolution(age);
@@ -3897,5 +3916,6 @@ module.exports = {
   dreamCore,
   doctor,
   exportHarness,
+  ingestHarness,
   projectEmbeddings3D,
 };
