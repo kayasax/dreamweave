@@ -152,9 +152,20 @@ function renderNodeEnvelope(db, node, opts = {}) {
   return String(node.fact || "").trim();
 }
 
+// A rendered envelope is ENGINE-AUTHORED text: the header + derived-index notice that
+// export-harness wraps around a gist or chronicle before the host stores it. When that text
+// comes back through ingest it must never be mistaken for a user edit of the fact -- storing
+// it would replace the fact with its own presentation, and the next render would wrap the
+// wrapper (a header accumulating every night while the real text sinks inside).
+const RENDERED_ENVELOPE = /^\s*\[(?:SEMANTIC|TEMPORAL) MEMORY(?:\s|\u00b7|\])/;
+function isRenderedEnvelope(text) {
+  return RENDERED_ENVELOPE.test(String(text || ""));
+}
+
 module.exports = {
   chronicleMetadata,
   gistMetadata,
+  isRenderedEnvelope,
   renderChronicleEnvelope,
   renderNodeEnvelope,
   renderSemanticEnvelope,

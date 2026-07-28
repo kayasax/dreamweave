@@ -34,7 +34,7 @@ const { buildNodeText } = require("./graphtext");
 const ent = require("./entities");
 const langsvc = require("./langsvc");
 const { ensureSchema } = require("./schema");
-const { renderNodeEnvelope } = require("./memory-render");
+const { renderNodeEnvelope, isRenderedEnvelope } = require("./memory-render");
 const { ageDays, ageTag, earliestTextDate } = require("./timeline");
 const cfg = require("../config");
 const tuning = require("./tuning");
@@ -418,6 +418,11 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
       const mid = m.id || m.memory_id; if (!mid) continue;
       const fact = normalizeHarnessFact(m.fact);
       const category = m.category || "fact";
+      // ENGINE-RENDERED text coming back from the harness is a projection of a fact, not an
+      // assertion about it: export-harness wraps gists and chronicles in an envelope before
+      // the host stores them. Treat it as "no edit" so the fact is never replaced by its own
+      // presentation (which the next export would wrap again, compounding every night).
+      const rendered = isRenderedEnvelope(fact);
       // ENGINE-OWNED ANCHOR (channel E) is re-emitted by export-harness, never stored as a node.
       // If the harness still carries a copy (it was m_remember'd as the projected anchor, or was
       // ingested as a normal fact before this guard existed), capture its id in `meta` so the
@@ -458,7 +463,7 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
           ex.source_day = sourceDay;
           res.backfilled += 1;
         }
-        const newFact = fact || ex.fact;
+        const newFact = (rendered ? ex.fact : fact) || ex.fact;
         // Chronicles are ENGINE-OWNED and signature-first (chronicle:<res>:<period>:v<n>): the db
         // is their source of truth, not the harness. A superseded version still sitting in the
         // harness is projection lag, not user re-confirmation, so it must NOT be revived — doing
@@ -493,6 +498,11 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
       // salience judge. `category` is retained below as a display label (in the salience column),
       // never as a class, so a harness 'decision' tag can't pin low-stakes daily-life facts.
       const cls = "episodic";
+      // An envelope under an id the db does not know is a projection whose id has not been
+      // bound yet (m_remember ran, record-projection has not). The node it renders already
+      // exists under its own signature -- minting a `fact:` node from the rendering would
+      // duplicate it as an ordinary fact and pollute graph + recall.
+      if (rendered) { res.skipped_rendered = (res.skipped_rendered || 0) + 1; continue; }
       const sig = uniqueSig(db, `fact:${deriveSlug(fact)}`);
       const id = nextId(db);
       const seq = changedSeq();
