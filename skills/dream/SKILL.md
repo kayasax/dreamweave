@@ -273,7 +273,10 @@ Two nodes are linkable when they **share a referent**. Signals, in priority:
      facts (and, for coarser periods, the finer child chronicles **in full**) that fall in the window — the
      ONLY sigs you may cite. `entitySigs` on a member are the caller-approved entity hubs it mentions.
 
-     judge: for each candidate write ONE `summary` and an ordered `entries[]` timeline.
+     judge: choose a manageable subset of candidates and write ONE `summary` plus an ordered
+     `entries[]` timeline for each. **When a day candidate exists, always include the newest day**
+     so the live timeline advances; use remaining capacity for older or coarser backlog. Omitted
+     candidates remain pending for the next report and do not block the selected periods.
 
      **`summary` is the period's retrieval surface.** It is embedded and later matched against
      natural-language questions — *"what happened around \<date\>"*, *"what changed with X"*,
@@ -306,13 +309,11 @@ Two nodes are linkable when they **share a referent**. Signals, in priority:
      `members`). **Coverage is mandatory and complete**: every member sig MUST appear in some entry's
      `evidenceSigs`, or the period is rejected (`incomplete_coverage`). Coverage is a structural property
      of the evidence links — satisfy it by attaching sigs to the entry they belong to, never by bucketing
-     everything into one entry per `changeKind`. Decide EVERY candidate in the report — a period neither
-     decided nor otherwise handled is rejected `period_missing`. Never invent sigs, periods, entities,
-     dates, or entries.
+     everything into one entry per `changeKind`. Never invent sigs, periods, entities, dates, or entries.
      decision: `{report_id, decisions:[{periodId, summary, entries:[{slot, summary, changeKind, stateLabel?, aspect?, entitySigs?, evidenceSigs:[...]}]}]}`
-     Apply is **report-bound and atomic**: a stale/missing `report_id`, any malformed/duplicate/
-     uncovered period, or any evidence/entity sig outside the candidate rejects the WHOLE apply
-     (`complete:false`, structured `rejected`, zero mutation). Applied chronicles persist as
+     Apply is report-bound and **atomic per period**: a stale/missing `report_id` rejects the
+     whole apply, while malformed/duplicate/uncovered submitted periods are rejected individually
+     without blocking other valid periods. Omitted periods remain pending. Applied chronicles persist as
      `kind='chronicle'` nodes (with `chronicle_entries`/`chronicle_evidence`) that project to Tier 1 as
      `tier='chronicle'` temporal memories and recall through the `--timeline` axis; older fine periods
      archive only once coarser coverage exists. `doctor` reports

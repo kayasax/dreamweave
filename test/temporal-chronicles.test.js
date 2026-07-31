@@ -32,14 +32,25 @@ process.env.AGENT_MEMORY_DIR = dataDir;
     db.prepare("INSERT INTO edges(src,rel,dst,weight,first_seen,last_reinforced) VALUES (?,'mentions','person:theresa-caldwell',0.8,?,?)")
       .run(sig, at, at);
   }
+  const olderFact = "The Caldwell reschedule request was opened the previous day.";
+  const older = db.prepare(`
+    INSERT INTO nodes(signature,memory_id,kind,class,strength,first_seen,source_day,last_reactivated,last_decayed,notes,fact,text,ingested_seq,dirty_seq)
+    VALUES ('fact:caldwell-opened','','fact','episodic',0.6,'2026-06-24T15:00:00.000Z','2026-06-24',
+            '2026-06-24T15:00:00.000Z','2026-06-24T15:00:00.000Z','harness-ingest',?,?,1,1)
+  `).run(olderFact, olderFact);
+  db.prepare("INSERT INTO vec_nodes(rowid,embedding) VALUES (?,?)")
+    .run(BigInt(older.lastInsertRowid), toVecBlob(await embedOne(olderFact)));
   db.prepare("INSERT OR REPLACE INTO meta(key,value) VALUES ('change_seq','1')").run();
 
   const report = reportChronicles(db, { asOf: "2026-06-25" });
   const day = report.candidates.find((c) => c.periodId === "day:2026-06-25:2026-06-25");
   if (!day || day.members.length !== 2) throw new Error("closed day did not become a chronicle candidate");
-  const incompleteApply = await applyChronicles(db, { report_id: report.report_id, decisions: [] }, { asOf: "2026-06-25" });
-  if (incompleteApply.complete || !incompleteApply.rejected.some((row) => row.reason === "period_missing" && row.periodId === day.periodId)) {
-    throw new Error("engine accepted a partial chronicle decision set");
+  if (report.candidates[0].periodId !== day.periodId) {
+    throw new Error("newest day was not prioritized for live timeline progress");
+  }
+  const noOpApply = await applyChronicles(db, { report_id: report.report_id, decisions: [] }, { asOf: "2026-06-25" });
+  if (!noOpApply.complete || noOpApply.chronicles_created !== 0 || noOpApply.pending !== report.candidates.length) {
+    throw new Error("omitted chronicle periods did not remain pending");
   }
   const applied = await applyChronicles(db, {
     report_id: report.report_id,
@@ -68,7 +79,13 @@ process.env.AGENT_MEMORY_DIR = dataDir;
       ],
     }],
   }, { asOf: "2026-06-25" });
-  if (!applied.complete || applied.chronicles_created !== 1) throw new Error(`chronicle apply failed: ${JSON.stringify(applied)}`);
+  if (!applied.complete || applied.chronicles_created !== 1 || applied.pending !== report.candidates.length - 1) {
+    throw new Error(`partial chronicle apply failed: ${JSON.stringify(applied)}`);
+  }
+  const remaining = reportChronicles(db, { asOf: "2026-06-25" });
+  if (!remaining.candidates.some((c) => c.periodId === "day:2026-06-24:2026-06-24")) {
+    throw new Error("omitted older period did not remain available after partial progress");
+  }
   const chronicle = db.prepare("SELECT n.signature,n.kind,n.notes,c.resolution,c.covered_event_count FROM nodes n JOIN chronicles c ON c.node_sig=n.signature").get();
   if (!chronicle || chronicle.kind !== "chronicle" || chronicle.resolution !== "day" || chronicle.covered_event_count !== 2) {
     throw new Error("chronicle node or metadata was not persisted");

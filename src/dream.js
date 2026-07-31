@@ -2818,7 +2818,7 @@ function chronicleEntitiesForMembers(db, rows) {
 function chronicleCandidates(db, opts = {}) {
   const asOf = isoDay(opts.asOf || new Date().toISOString());
   if (!asOf) return [];
-  const maxCandidates = Math.max(1, Number(opts.maxCandidates) || 32);
+  const maxCandidates = Math.max(1, Number(opts.maxCandidates) || 8);
   // Re-summarization: a period is normally reported once and then skipped forever, because
   // its stored coverage_seq already covers every member. When the judging contract changes,
   // the existing summaries are stale in a way no member edit will ever signal, so callers
@@ -2854,8 +2854,17 @@ function chronicleCandidates(db, opts = {}) {
     }
   }
   const candidates = [];
-  for (const period of periods.sort((a, b) => a.end.localeCompare(b.end)
-    || CHRONICLE_RESOLUTIONS.indexOf(a.resolution) - CHRONICLE_RESOLUTIONS.indexOf(b.resolution))) {
+  const orderedPeriods = periods.sort((a, b) => {
+    if (!resummarize) {
+      const byEnd = b.end.localeCompare(a.end);
+      if (byEnd) return byEnd;
+    } else {
+      const byEnd = a.end.localeCompare(b.end);
+      if (byEnd) return byEnd;
+    }
+    return CHRONICLE_RESOLUTIONS.indexOf(a.resolution) - CHRONICLE_RESOLUTIONS.indexOf(b.resolution);
+  });
+  for (const period of orderedPeriods) {
     let rows;
     if (period.resolution === "day") {
       rows = db.prepare(`
@@ -2939,7 +2948,6 @@ function validateChronicleDecisions(db, raw, candidates) {
   if (!Array.isArray(raw)) return { decisions: [], rejected: [{ index: null, reason: "malformed_decision_file" }] };
   const byPeriod = new Map(candidates.map((c) => [c.periodId, c]));
   const seen = new Set();
-  const accepted = new Set();
   const decisions = [];
   const rejected = [];
   for (let index = 0; index < raw.length; index += 1) {
@@ -2990,11 +2998,6 @@ function validateChronicleDecisions(db, raw, candidates) {
     const missing = [...validMembers].filter((sig) => !covered.has(sig));
     if (missing.length) { rejected.push({ index, reason: "incomplete_coverage", periodId: dec.periodId, missing }); continue; }
     decisions.push({ candidate: cand, summary: dec.summary.trim(), entries });
-    accepted.add(dec.periodId);
-  }
-  for (const candidate of candidates) {
-    if (accepted.has(candidate.periodId) || rejected.some((row) => row.periodId === candidate.periodId)) continue;
-    rejected.push({ index: null, reason: "period_missing", periodId: candidate.periodId });
   }
   return { decisions, rejected };
 }
@@ -3012,9 +3015,6 @@ async function applyChronicles(db, raw, opts = {}) {
     };
   }
   const validation = validateChronicleDecisions(db, input.decisions, currentReport.candidates);
-  if (validation.rejected.length) {
-    return { surface: "chronicles", complete: false, reviewed: false, chronicles_created: 0, rejected: validation.rejected };
-  }
   const prepared = [];
   for (const dec of validation.decisions) {
     const text = `${dec.summary}\n${dec.entries.map((e) => `${e.slot}: ${e.summary}`).join("\n")}`;
@@ -3108,9 +3108,11 @@ async function applyChronicles(db, raw, opts = {}) {
     }
   })();
   return {
-    surface: "chronicles", complete: true, reviewed: true,
+    surface: "chronicles", complete: validation.rejected.length === 0,
+    reviewed: validation.decisions.length > 0,
     decisions: validation.decisions.length, chronicles_created: created.length,
-    created, rejected: [],
+    pending: currentReport.candidates.length - validation.decisions.length,
+    created, rejected: validation.rejected,
   };
 }
 // ---- CONSOLIDATE (report merge candidates; pressure-aware threshold) --------
