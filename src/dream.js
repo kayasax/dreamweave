@@ -412,7 +412,7 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
   const updFirstSeen = db.prepare("UPDATE nodes SET first_seen=?, source_day=?, dirty_seq=? WHERE id=?");
   const insNode = db.prepare(`INSERT INTO nodes(id,signature,memory_id,kind,class,salience,strength,reactivations,first_seen,source_day,last_reactivated,last_decayed,notes,fact,text,ingested_seq,dirty_seq)
         VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?)`);
-  const res = { harness_count: mems.length, created: 0, refreshed: 0, backfilled: 0, demoted: 0, pruned: 0 };
+  const res = { harness_count: mems.length, created: 0, refreshed: 0, backfilled: 0, projection_reset: 0, demoted: 0, pruned: 0 };
   const harnessIds = new Set(mems.map((m) => m.id || m.memory_id).filter(Boolean));
   let ingestSeq = 0;
   const changedSeq = () => {
@@ -518,23 +518,13 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
     }
     if (prune) {
       // The db is authoritative and the harness is only a bounded projection. An omitted
-      // Tier-1 row may be a deliberate projection eviction or a stale harness id, so demote
-      // it to cold storage rather than deleting evidence or derived lineage.
+      // Tier-1 row has lost its live harness binding, not its evidence value. Clear only the
+      // stale id so export-harness emits the active survivor for re-projection.
       const stale = db.prepare("SELECT id, signature, memory_id FROM nodes WHERE kind='fact' AND memory_id<>'' AND (notes IS NULL OR notes NOT IN ('detail','archive'))").all().filter((n) => !harnessIds.has(n.memory_id));
       for (const n of stale) {
-        for (const e of db.prepare("SELECT src,rel,dst,first_seen,last_reinforced FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").all(n.signature, n.signature)) {
-          preserveEvidenceTransition(db, e.src, e.rel, e.dst, e.first_seen, e.last_reinforced);
-        }
-        const blob = storedVecBlob(db, n.id);
-        db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
-        db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(BigInt(n.id));
-        if (blob) {
-          db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(BigInt(n.id));
-          db.prepare("INSERT INTO vec_archive(rowid,embedding) VALUES (?,?)").run(BigInt(n.id), blob);
-        }
-        db.prepare("UPDATE nodes SET memory_id='', notes='archive', last_decayed=?, dirty_seq=? WHERE id=?")
-          .run(now, changedSeq(), n.id);
-        res.demoted += 1;
+        db.prepare("UPDATE nodes SET memory_id='', dirty_seq=? WHERE id=?")
+          .run(changedSeq(), n.id);
+        res.projection_reset += 1;
       }
     }
   });

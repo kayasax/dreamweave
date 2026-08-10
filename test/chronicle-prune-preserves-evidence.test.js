@@ -51,7 +51,7 @@ db = new Database(path.join(dataDir, "memory.db"));
 sqliteVec.load(db);
 const evidence = db.prepare("SELECT memory_id,notes FROM nodes WHERE signature='fact:delete-me'").get();
 const chronicle = db.prepare("SELECT 1 FROM nodes WHERE signature='chronicle:day:2026-01-07:v1'").get();
-if (!evidence || evidence.memory_id !== "" || evidence.notes !== "archive" || !chronicle) {
+if (!evidence || evidence.memory_id !== "" || evidence.notes !== "harness-ingest" || !chronicle) {
   throw new Error("projection prune deleted authoritative chronicle evidence");
 }
 for (const [table, expected] of [

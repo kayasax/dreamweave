@@ -46,25 +46,37 @@ const { doctor } = require("../src/dream");
     path.join(__dirname, "..", "src", "dream.js"),
     "ingest-harness", "--file", harness, "--prune", "true", "--as-of", "2026-07-27",
   ], { env: { ...process.env, AGENT_MEMORY_DIR: dataDir }, encoding: "utf8" }));
-  if (result.demoted !== 1 || result.pruned !== 0) {
-    throw new Error(`projection omission was not demoted safely: ${JSON.stringify(result)}`);
+  if (result.projection_reset !== 1 || result.demoted !== 0 || result.pruned !== 0) {
+    throw new Error(`projection omission was not reset safely: ${JSON.stringify(result)}`);
   }
 
   db = new Database(path.join(dataDir, "memory.db"));
   sqliteVec.load(db);
   const parent = db.prepare("SELECT memory_id,notes FROM nodes WHERE signature='fact:projected-gist'").get();
+  const activeVector = db.prepare("SELECT 1 FROM vec_nodes JOIN nodes ON nodes.id=vec_nodes.rowid WHERE nodes.signature='fact:projected-gist'").get();
+  const relatedEdge = db.prepare("SELECT 1 FROM edges WHERE src='fact:projected-gist' AND rel='related_to' AND dst='fact:retained-detail'").get();
   const lineage = db.prepare("SELECT 1 FROM detail_of WHERE detail_sig='fact:retained-detail' AND gist_sig='fact:projected-gist'").get();
   const transition = db.prepare("SELECT 1 FROM evidence_transitions WHERE src_sig='fact:retained-detail' AND dst_sig='fact:sequence-peer'").get();
   const health = doctor(db);
-  if (!parent || parent.memory_id !== "" || parent.notes !== "archive" || !lineage || !transition) {
-    throw new Error("projection omission destroyed authoritative evidence or lineage");
+  if (!parent || parent.memory_id !== "" || parent.notes !== "gist" || !activeVector || !relatedEdge || !lineage || !transition) {
+    throw new Error("projection reset removed the active survivor or its authoritative graph");
   }
   if (!health.healthy || health.fact_islands !== 0 || health.invalid_evidence_transitions !== 0) {
-    throw new Error(`demoted projection was unhealthy: ${JSON.stringify(health)}`);
+    throw new Error(`reset projection was unhealthy: ${JSON.stringify(health)}`);
   }
   db.close();
+
+  const projected = JSON.parse(execFileSync(process.execPath, [
+    path.join(__dirname, "..", "src", "dream.js"),
+    "export-harness",
+  ], { env: { ...process.env, AGENT_MEMORY_DIR: dataDir }, encoding: "utf8" }));
+  const survivor = projected.find((m) => m.signature === "fact:projected-gist");
+  if (!survivor || survivor.memory_id !== "") {
+    throw new Error("reset projection was not emitted for a new harness binding");
+  }
+
   fs.rmSync(dataDir, { recursive: true, force: true });
-  console.log("PASS: projection prune demotes without destroying lineage or transitions");
+  console.log("PASS: projection prune resets the binding without hiding the survivor");
 })().catch((error) => {
   console.error(error);
   try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch {}
