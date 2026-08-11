@@ -2864,7 +2864,8 @@ function chronicleCandidates(db, opts = {}) {
     let rows;
     if (period.resolution === "day") {
       rows = db.prepare(`
-        SELECT signature sig,fact,source_day sourceDay,dirty_seq coverageSeq,'fact' memberKind
+        SELECT signature sig,fact,source_day sourceDay,dirty_seq coverageSeq,
+               coalesce(notes,'') notes,'fact' memberKind
         FROM nodes
         WHERE kind='fact' AND source_day=?
           AND coalesce(notes,'')<>'gist' AND fact IS NOT NULL AND trim(fact)<>''
@@ -2887,13 +2888,31 @@ function chronicleCandidates(db, opts = {}) {
     if (!rows.length) continue;
     const coverageSeq = Math.max(0, ...rows.map((r) => Number(r.coverageSeq) || 0));
     const current = db.prepare(`
-      SELECT max(version) version,max(coverage_seq) coverage_seq,max(created_at) created_at
+      SELECT node_sig,version,coverage_seq,created_at
       FROM chronicles WHERE resolution=? AND period_start=? AND period_end=?
+      ORDER BY version DESC LIMIT 1
     `).get(period.resolution, period.start, period.end);
     const covered = current && Number(current.version) > 0 && Number(current.coverage_seq) >= coverageSeq;
     const reopen = (resummarize === "*" || resummarize === period.resolution)
       && (!resummarizeBefore || String((current && current.created_at) || "") < resummarizeBefore);
-    if (covered && !reopen) continue;
+    let evidenceInvisible = false;
+    if (covered && current && current.node_sig) {
+      const evidence = db.prepare(`
+        SELECT count(*) total,
+               sum(CASE WHEN n.signature IS NOT NULL
+                         AND coalesce(n.notes,'')<>'archive' THEN 1 ELSE 0 END) active
+        FROM chronicle_evidence ce
+        LEFT JOIN nodes n ON n.signature=ce.evidence_sig
+        WHERE ce.chronicle_sig=?
+      `).get(current.node_sig);
+      evidenceInvisible = Number(evidence && evidence.total) > 0
+        && Number(evidence && evidence.active) === 0;
+    }
+    if (covered && !reopen && !evidenceInvisible) continue;
+    if (evidenceInvisible && period.resolution === "day") {
+      rows = rows.filter((r) => r.notes !== "archive");
+      if (!rows.length) continue;
+    }
     const entitiesBySig = chronicleEntitiesForMembers(db, rows);
     const members = rows.map((r) => ({
       sig: r.sig,
@@ -3825,6 +3844,43 @@ function stats(db) {
 
 // ---- CLI --------------------------------------------------------------------
 
+// ---- OBSERVATION POINTS (Phase 6c, EPIC #538) ------------------------------
+// Record privacy-safe numeric metrics at each of the six dreamweave steps.
+// Observation writes are fire-and-forget: failures are logged to stderr and
+// NEVER propagate to the nightly pipeline.  Shadow-only -- no behavioral
+// adaptation, no threshold change, no outbound action.
+const { spawnSync } = require("child_process");
+const OBS_PYTHON = process.env.OBS_PYTHON || "python";
+// Resolve the observation_points.py path relative to this file's directory.
+const OBS_SCRIPT = path.join(
+  path.dirname(path.resolve(__dirname, "..")),
+  "case-brain", "bin", "observation_points.py"
+);
+
+function recordObservationPoint(stepName, data, durationMs) {
+  // Fail-open: any error is logged to stderr and ignored.
+  try {
+    if (!fs.existsSync(OBS_SCRIPT)) return;
+    const args = [OBS_SCRIPT, "record", "--step", stepName];
+    if (data.item_count != null)    args.push("--item-count",    String(Math.round(data.item_count)));
+    if (data.created_count != null) args.push("--created-count", String(Math.round(data.created_count)));
+    if (data.updated_count != null) args.push("--updated-count", String(Math.round(data.updated_count)));
+    if (data.deleted_count != null) args.push("--deleted-count", String(Math.round(data.deleted_count)));
+    if (durationMs != null)         args.push("--duration-ms",   String(Math.round(durationMs)));
+    args.push("--ok", data.ok === false ? "0" : "1");
+    if (data.error_msg)             args.push("--error-msg", String(data.error_msg).slice(0, 500));
+    // extra_json: only numeric values, privacy-safe
+    const extra = {};
+    for (const [k, v] of Object.entries(data.extra || {})) {
+      if (typeof v === "number" && isFinite(v)) extra[k] = v;
+    }
+    if (Object.keys(extra).length) args.push("--extra-json", JSON.stringify(extra));
+    spawnSync(OBS_PYTHON, args, { timeout: 10000, stdio: ["ignore", "ignore", "pipe"] });
+  } catch (e) {
+    process.stderr.write(`[observation_points] record failed (non-fatal): ${e.message}\n`);
+  }
+}
+
 // `config` subcommand: inspect / set the four behavioral knobs (persisted to
 // memory.config.json).
 function configCmd(argv) {
@@ -3861,7 +3917,25 @@ async function main() {
     let r, gate = false;
     if (cmd === "init") r = { initialized: true, db: DB_PATH, data_dir: DATA_DIR };
     else if (cmd === "migrate-model") r = migrateModel(db);
-    else if (cmd === "ingest-harness") { r = await ingestHarness(db, flags.file, flags.prune === true || flags.prune === "true", flags["as-of"], flags["backfill-dates"] === true || flags["backfill-dates"] === "true"); gate = !r.complete; }
+    else if (cmd === "ingest-harness") {
+      const t0Ingest = Date.now();
+      let ingestOk = true, ingestErr = "";
+      try {
+        r = await ingestHarness(db, flags.file, flags.prune === true || flags.prune === "true", flags["as-of"], flags["backfill-dates"] === true || flags["backfill-dates"] === "true");
+        gate = !r.complete;
+      } catch (e) { ingestOk = false; ingestErr = e.message || String(e); throw e; }
+      finally {
+        recordObservationPoint("INGEST", {
+          item_count: r && r.harness_count,
+          created_count: r && r.created,
+          updated_count: r && r.refreshed,
+          deleted_count: r && ((r.demoted || 0) + (r.pruned || 0)),
+          ok: ingestOk,
+          error_msg: ingestErr || undefined,
+          extra: r ? { projection_reset: r.projection_reset || 0, backfilled: r.backfilled || 0 } : {},
+        }, Date.now() - t0Ingest);
+      }
+    }
     else if (cmd === "verify-sync") { r = verifySync(db, flags.file); gate = !r.complete; }
     else if (cmd === "repair-dates") r = repairDatesFromText(db, { dryRun: flags["dry-run"] === true || flags["dry-run"] === "true", allowLater: flags["allow-later"] === true || flags["allow-later"] === "true" });
     else if (cmd === "dream") {
@@ -3869,16 +3943,92 @@ async function main() {
       // edges until weave runs, so dreamCore cannot discover that their subjects
       // reappeared if it runs first. Keep this ordering inside the engine rather than
       // relying on every host skill/cron integration to orchestrate it correctly.
-      const preweave = await weave(db, { asOf: flags["as-of"], supersede: T.supersede });
-      r = { ...dreamCore(db, flags), preweave };
+      const t0Weave = Date.now();
+      let preweave, weaveOk = true, weaveErr = "";
+      try {
+        preweave = await weave(db, { asOf: flags["as-of"], supersede: T.supersede });
+      } catch (e) { weaveOk = false; weaveErr = e.message || String(e); throw e; }
+      finally {
+        recordObservationPoint("WEAVE", {
+          item_count: preweave && preweave.weaved,
+          created_count: preweave && preweave.mention_edges,
+          updated_count: preweave && preweave.new_entity_hubs,
+          ok: weaveOk,
+          error_msg: weaveErr || undefined,
+          extra: preweave ? {
+            remaining_islands: preweave.remaining_islands || 0,
+            related_edges: preweave.related_edges || 0,
+            similar_edges: preweave.similar_edges || 0,
+          } : {},
+        }, Date.now() - t0Weave);
+      }
+      const t0Dream = Date.now();
+      let dreamResult, dreamOk = true, dreamErr = "";
+      try {
+        dreamResult = dreamCore(db, flags);
+      } catch (e) { dreamOk = false; dreamErr = e.message || String(e); throw e; }
+      finally {
+        recordObservationPoint("DREAM", {
+          item_count: dreamResult && dreamResult.facts,
+          created_count: dreamResult && dreamResult.reactivated,
+          deleted_count: dreamResult && (
+            (dreamResult.evaporated_episodic || 0)
+            + (dreamResult.evaporated_semantic || 0)
+            + (dreamResult.demoted_to_tier3 || 0)
+          ),
+          ok: dreamOk,
+          error_msg: dreamErr || undefined,
+          extra: dreamResult ? {
+            pressure: typeof dreamResult.pressure === "number" ? Math.round(dreamResult.pressure * 1000) / 1000 : 0,
+            pruned_hubs: dreamResult.pruned_hubs || 0,
+          } : {},
+        }, Date.now() - t0Dream);
+      }
+      r = { ...dreamResult, preweave };
     }
-    else if (cmd === "weave") r = await weave(db, { k: Number(flags.k) || 3, sim: Number(flags.sim) || 0.45, asOf: flags["as-of"], supersede: flags.supersede === true || flags.supersede === "true" || T.supersede });
+    else if (cmd === "weave") {
+      const t0 = Date.now();
+      let weaveOk = true, weaveErr = "";
+      try {
+        r = await weave(db, { k: Number(flags.k) || 3, sim: Number(flags.sim) || 0.45, asOf: flags["as-of"], supersede: flags.supersede === true || flags.supersede === "true" || T.supersede });
+      } catch (e) { weaveOk = false; weaveErr = e.message || String(e); throw e; }
+      finally {
+        recordObservationPoint("WEAVE", {
+          item_count: r && r.weaved,
+          created_count: r && r.mention_edges,
+          updated_count: r && r.new_entity_hubs,
+          ok: weaveOk,
+          error_msg: weaveErr || undefined,
+          extra: r ? {
+            remaining_islands: r.remaining_islands || 0,
+            related_edges: r.related_edges || 0,
+            similar_edges: r.similar_edges || 0,
+          } : {},
+        }, Date.now() - t0);
+      }
+    }
     else if (cmd === "report-entities") r = reportEntities(db, { asOf: flags["as-of"] });
     else if (cmd === "apply-entities") { r = await applyEntities(db, readDecisionFile(flags.file), { asOf: flags["as-of"] }); gate = r.complete === false; }
     else if (cmd === "report-aliases") r = reportAliases(db, { asOf: flags["as-of"] });
     else if (cmd === "apply-aliases") r = await applyAliases(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
     else if (cmd === "report-salience") r = reportSalience(db, { asOf: flags["as-of"] });
-    else if (cmd === "apply-salience") r = applySalience(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
+    else if (cmd === "apply-salience") {
+      const t0 = Date.now();
+      let judgeOk = true, judgeErr = "";
+      try {
+        r = applySalience(db, readDecisionFile(flags.file), { asOf: flags["as-of"] });
+      } catch (e) { judgeOk = false; judgeErr = e.message || String(e); throw e; }
+      finally {
+        recordObservationPoint("JUDGE", {
+          item_count: r && ((r.salient_tagged || 0) + (r.scored || 0) + (r.downgraded || 0)),
+          created_count: r && r.salient_tagged,
+          deleted_count: r && r.downgraded,
+          ok: judgeOk,
+          error_msg: judgeErr || undefined,
+          extra: r ? { spotlighted: r.spotlighted || 0, scored_weak: r.scored || 0 } : {},
+        }, Date.now() - t0);
+      }
+    }
     else if (cmd === "report-merges" || cmd === "consolidate") r = await reportMerges(db, { asOf: flags["as-of"], sim: Number(flags.sim) || 0 });
     else if (cmd === "apply-merges") { r = await applyMerges(db, readDecisionFile(flags.file), { asOf: flags["as-of"], sim: Number(flags.sim) || 0 }); gate = r.complete === false; }
     else if (cmd === "report-synthesis") r = reportSynthesis(db, { asOf: flags["as-of"] });
@@ -3888,7 +4038,27 @@ async function main() {
     else if (cmd === "apply-concept") { const g = JSON.parse(fs.readFileSync(flags.file, "utf8")); r = await applyConcept(db, g, { asOf: flags["as-of"] }); repairGraph(db); }
     else if (cmd === "budget") r = await budget(db);
     else if (cmd === "doctor") { r = doctor(db); gate = !r.healthy; }
-    else if (cmd === "export-harness") r = exportHarness(db, flags["as-of"]);
+    else if (cmd === "export-harness") {
+      const t0 = Date.now();
+      let projectOk = true, projectErr = "";
+      try {
+        r = exportHarness(db, flags["as-of"]);
+      } catch (e) { projectOk = false; projectErr = e.message || String(e); throw e; }
+      finally {
+        const total = Array.isArray(r) ? r.length : 0;
+        const gistCount = Array.isArray(r) ? r.filter((m) => m.tier === "gist").length : 0;
+        const episodicCount = Array.isArray(r) ? r.filter((m) => m.tier === "episodic").length : 0;
+        const chronicleCount = Array.isArray(r) ? r.filter((m) => m.tier === "chronicle").length : 0;
+        recordObservationPoint("PROJECT", {
+          item_count: total,
+          created_count: gistCount,
+          updated_count: episodicCount,
+          ok: projectOk,
+          error_msg: projectErr || undefined,
+          extra: { chronicle_count: chronicleCount },
+        }, Date.now() - t0);
+      }
+    }
     else if (cmd === "record-projection") r = recordProjection(db, flags.file);
     else if (cmd === "export-viz") r = exportViz(db);
     else if (cmd === "stats") r = stats(db);
