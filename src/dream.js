@@ -2864,8 +2864,7 @@ function chronicleCandidates(db, opts = {}) {
     let rows;
     if (period.resolution === "day") {
       rows = db.prepare(`
-        SELECT signature sig,fact,source_day sourceDay,dirty_seq coverageSeq,
-               coalesce(notes,'') notes,'fact' memberKind
+        SELECT signature sig,fact,source_day sourceDay,dirty_seq coverageSeq,'fact' memberKind
         FROM nodes
         WHERE kind='fact' AND source_day=?
           AND coalesce(notes,'')<>'gist' AND fact IS NOT NULL AND trim(fact)<>''
@@ -2888,31 +2887,13 @@ function chronicleCandidates(db, opts = {}) {
     if (!rows.length) continue;
     const coverageSeq = Math.max(0, ...rows.map((r) => Number(r.coverageSeq) || 0));
     const current = db.prepare(`
-      SELECT node_sig,version,coverage_seq,created_at
+      SELECT max(version) version,max(coverage_seq) coverage_seq,max(created_at) created_at
       FROM chronicles WHERE resolution=? AND period_start=? AND period_end=?
-      ORDER BY version DESC LIMIT 1
     `).get(period.resolution, period.start, period.end);
     const covered = current && Number(current.version) > 0 && Number(current.coverage_seq) >= coverageSeq;
     const reopen = (resummarize === "*" || resummarize === period.resolution)
       && (!resummarizeBefore || String((current && current.created_at) || "") < resummarizeBefore);
-    let evidenceInvisible = false;
-    if (covered && current && current.node_sig) {
-      const evidence = db.prepare(`
-        SELECT count(*) total,
-               sum(CASE WHEN n.signature IS NOT NULL
-                         AND coalesce(n.notes,'')<>'archive' THEN 1 ELSE 0 END) active
-        FROM chronicle_evidence ce
-        LEFT JOIN nodes n ON n.signature=ce.evidence_sig
-        WHERE ce.chronicle_sig=?
-      `).get(current.node_sig);
-      evidenceInvisible = Number(evidence && evidence.total) > 0
-        && Number(evidence && evidence.active) === 0;
-    }
-    if (covered && !reopen && !evidenceInvisible) continue;
-    if (evidenceInvisible && period.resolution === "day") {
-      rows = rows.filter((r) => r.notes !== "archive");
-      if (!rows.length) continue;
-    }
+    if (covered && !reopen) continue;
     const entitiesBySig = chronicleEntitiesForMembers(db, rows);
     const members = rows.map((r) => ({
       sig: r.sig,
