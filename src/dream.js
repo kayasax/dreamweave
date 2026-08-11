@@ -3857,6 +3857,28 @@ const OBS_SCRIPT = path.join(
   "case-brain", "bin", "observation_points.py"
 );
 
+// Resolve the adapt_lesson_gate.py path (Phase 6d, EPIC #538).
+// Called at end of PROJECT step only; fail-open (never breaks the pipeline).
+const ADAPT_LESSON_GATE_SCRIPT = path.join(
+  path.dirname(path.resolve(__dirname, "..")),
+  "case-brain", "bin", "adapt_lesson_gate.py"
+);
+
+function runAdaptLessonGate(dbPath) {
+  // Shadow-only: computes and persists a threshold recommendation to system_params.
+  // lesson_gate.py behavior is UNCHANGED. Fail-open: any error is logged and ignored.
+  // Live activation requires M_SAFLA_ADAPT_LIVE=1 AND lesson_gate.threshold.live_approved=1
+  // in system_params -- neither is set in Phase 6d.
+  try {
+    if (!fs.existsSync(ADAPT_LESSON_GATE_SCRIPT)) return;
+    const args = [ADAPT_LESSON_GATE_SCRIPT, "update"];
+    if (dbPath) args.push("--db", String(dbPath));
+    spawnSync(OBS_PYTHON, args, { timeout: 15000, stdio: ["ignore", "ignore", "pipe"] });
+  } catch (e) {
+    process.stderr.write(`[adapt_lesson_gate] PROJECT hook failed (non-fatal): ${e.message}\n`);
+  }
+}
+
 function recordObservationPoint(stepName, data, durationMs) {
   // Fail-open: any error is logged to stderr and ignored.
   try {
@@ -4049,6 +4071,10 @@ async function main() {
           error_msg: projectErr || undefined,
           extra: { chronicle_count: chronicleCount },
         }, Date.now() - t0);
+        // Phase 6d: adaptive lesson-gate threshold shadow recommendation.
+        // Shadow-only -- never changes lesson_gate.py behavior in Phase 6d.
+        // Failure is non-fatal and must not break the PROJECT pipeline.
+        runAdaptLessonGate(db.name);
       }
     }
     else if (cmd === "record-projection") r = recordProjection(db, flags.file);
