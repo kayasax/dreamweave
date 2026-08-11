@@ -3869,6 +3869,7 @@ function recordObservationPoint(stepName, data, durationMs) {
     if (durationMs != null)         args.push("--duration-ms",   String(Math.round(durationMs)));
     args.push("--ok", data.ok === false ? "0" : "1");
     if (data.error_msg)             args.push("--error-msg", String(data.error_msg).slice(0, 500));
+    if (data.run_kind)              args.push("--run-kind", String(data.run_kind));
     // extra_json: only numeric values, privacy-safe
     const extra = {};
     for (const [k, v] of Object.entries(data.extra || {})) {
@@ -3943,25 +3944,11 @@ async function main() {
       // edges until weave runs, so dreamCore cannot discover that their subjects
       // reappeared if it runs first. Keep this ordering inside the engine rather than
       // relying on every host skill/cron integration to orchestrate it correctly.
-      const t0Weave = Date.now();
-      let preweave, weaveOk = true, weaveErr = "";
-      try {
-        preweave = await weave(db, { asOf: flags["as-of"], supersede: T.supersede });
-      } catch (e) { weaveOk = false; weaveErr = e.message || String(e); throw e; }
-      finally {
-        recordObservationPoint("WEAVE", {
-          item_count: preweave && preweave.weaved,
-          created_count: preweave && preweave.mention_edges,
-          updated_count: preweave && preweave.new_entity_hubs,
-          ok: weaveOk,
-          error_msg: weaveErr || undefined,
-          extra: preweave ? {
-            remaining_islands: preweave.remaining_islands || 0,
-            related_edges: preweave.related_edges || 0,
-            similar_edges: preweave.similar_edges || 0,
-          } : {},
-        }, Date.now() - t0Weave);
-      }
+      // NOTE: this internal pre-weave is not instrumented as a WEAVE observation.
+      // The canonical WEAVE observation is emitted only by the standalone `weave`
+      // command (STEP 4). Recording it here would cause duplicate WEAVE rows on
+      // every nightly run and corrupt nightly averages. See EPIC #538.
+      const preweave = await weave(db, { asOf: flags["as-of"], supersede: T.supersede });
       const t0Dream = Date.now();
       let dreamResult, dreamOk = true, dreamErr = "";
       try {
@@ -3999,6 +3986,11 @@ async function main() {
           updated_count: r && r.new_entity_hubs,
           ok: weaveOk,
           error_msg: weaveErr || undefined,
+          // run_kind discriminates canonical (STEP 4) from reconnect (STEP 9d).
+          // Pass --run-kind reconnect when invoking from the journal reconnect step.
+          // Omitting --run-kind (or passing --run-kind canonical) marks the row
+          // as canonical and includes it in nightly trend averages.
+          run_kind: flags["run-kind"] || undefined,
           extra: r ? {
             remaining_islands: r.remaining_islands || 0,
             related_edges: r.related_edges || 0,
