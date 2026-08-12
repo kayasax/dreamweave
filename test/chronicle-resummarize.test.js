@@ -107,6 +107,31 @@ if (typeof chronicleOpts === "function") {
   }
 }
 
+// 8. A chronicle whose complete evidence set decayed to archive is stale even
+// when coverage_seq did not change. Reopen it with active replacement evidence.
+db.prepare(`INSERT INTO nodes(signature,kind,class,notes,fact,text,first_seen,source_day,last_decayed,last_reactivated,dirty_seq)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+  .run(`fact:replacement-${DAY}`, "fact", "semantic", "gist-child",
+    "active replacement evidence", "active replacement evidence",
+    `${DAY}T13:00:00Z`, DAY, now, now, 7);
+db.prepare(`INSERT INTO chronicle_entries(chronicle_sig,ordinal,slot_label,summary,change_kind)
+  VALUES (?,?,?,?,?)`)
+  .run(`chronicle:day:${DAY}:v1`, 0, DAY, "an old summary", "continuity");
+db.prepare(`INSERT INTO chronicle_evidence(chronicle_sig,entry_ordinal,evidence_sig)
+  VALUES (?,?,?)`).run(`chronicle:day:${DAY}:v1`, 0, `fact:evidence-${DAY}`);
+db.prepare("UPDATE nodes SET notes='archive' WHERE signature=?").run(`fact:evidence-${DAY}`);
+
+const decayed = reportChronicles(db, { asOf: "2026-06-01" }).candidates
+  .find((c) => c.resolution === "day" && c.periodStart === DAY);
+if (!decayed) fail("a chronicle with only archived evidence did not reopen");
+if (decayed.members.some((m) => m.sig === `fact:evidence-${DAY}`)
+  || !decayed.members.some((m) => m.sig === `fact:replacement-${DAY}`)) {
+  fail("the reopened chronicle did not replace archived evidence with active members");
+}
+db.prepare("UPDATE chronicle_evidence SET evidence_sig=? WHERE chronicle_sig=?")
+  .run(`fact:replacement-${DAY}`, `chronicle:day:${DAY}:v1`);
+if (dayPeriods({}) !== 0) fail("a chronicle with visible evidence reopened unnecessarily");
+
 db.close();
-console.log("PASS \u2713 chronicle re-summarization is scoped, batchable and terminates");
+console.log("PASS \u2713 chronicle re-summarization is scoped, batchable and repairs invisible evidence");
 fs.rmSync(dataDir, { recursive: true, force: true });
