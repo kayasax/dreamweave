@@ -14,6 +14,9 @@ const cfg = require("../config");
 const langsvc = require("./langsvc");
 const { chronicleMetadata, renderNodeEnvelope } = require("./memory-render");
 const { describeDerived, loadSupersededBy, reserveDerivedEvidence } = require("./derived-memory");
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
 
 // Resolve the pluggable language service (see langsvc.js). recall.js NEVER
 // hard-codes English temporal parsing, tokenization, or query-shape judgment
@@ -31,6 +34,48 @@ const ACT_LAMBDA = 0.2;
 const ACT_COS_FLOOR = 0.30;
 const ACT_SUPERSEDE_PENALTY = 0.15;
 const ACT_DETAIL_PENALTY = 0.12;
+
+// ---- Lesson index scoring (#538 SLM) ----------------------------------------
+// Reuses the already-computed qFloat; no second embedding call or model load.
+// Pre-filters at ACT_COS_FLOOR; Scout/merlin-layer2 applies SLM_THRESHOLD (0.50).
+const LESSON_INDEX_PATH = process.env.LESSON_INDEX_PATH
+  || path.join(
+    process.env.MERLIN_CONFIG_HOME || path.join(os.homedir(), ".copilot"),
+    "case-brain", "data", "lesson-index.json",
+  );
+const LESSON_INDEX_TOP_K = 3;
+
+function loadLessonIndex() {
+  try {
+    if (!fs.existsSync(LESSON_INDEX_PATH)) return null;
+    return JSON.parse(fs.readFileSync(LESSON_INDEX_PATH, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+function scoreLessonIndex(qFloat, lessonIndex) {
+  if (!lessonIndex || !Array.isArray(lessonIndex.entries) || lessonIndex.entries.length === 0) return [];
+  return lessonIndex.entries
+    .map((e) => {
+      if (!Array.isArray(e.embedding)) return null;
+      let sim = 0;
+      const n = Math.min(qFloat.length, e.embedding.length);
+      for (let i = 0; i < n; i++) sim += qFloat[i] * e.embedding[i];
+      if (sim < ACT_COS_FLOOR) return null;
+      return {
+        id: e.id,
+        statement: e.statement,
+        trigger: e.trigger || null,
+        enforcement: e.enforcement || null,
+        severity: e.severity || null,
+        similarity: Number(sim.toFixed(4)),
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.similarity - a.similarity)
+    .slice(0, LESSON_INDEX_TOP_K);
+}
 
 function activationScore(cosine, strength, opts = {}) {
   const gate = cosine >= ACT_COS_FLOOR ? 1 : 0;
@@ -1214,6 +1259,10 @@ async function main() {
     })
     .slice(0, Math.max(6, args.k, reservedEvidenceSlots));
 
+  // Lesson index scoring (#538 SLM): reuse qFloat, no extra embedding call.
+  const lessonIndex = loadLessonIndex();
+  out.lessonMatches = scoreLessonIndex(qFloat, lessonIndex);
+
   console.log(JSON.stringify(out, null, 2));
 }
 
@@ -1221,4 +1270,4 @@ if (require.main === module) {
   main().catch((e) => { console.error("SEARCH ERROR:", e); process.exit(1); });
 }
 
-module.exports = { parseDateRange, selectLexicalSeeds, significantTerms, activationScore, rankSeedCandidates };
+module.exports = { parseDateRange, selectLexicalSeeds, significantTerms, activationScore, rankSeedCandidates, scoreLessonIndex };

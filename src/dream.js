@@ -3586,6 +3586,17 @@ const ANCHOR_MEMORY_FACT =
   "for the specific value first. Exact numbers and dates are kept in the detailed store even " +
   "when the summary omits them; never enumerate a list or cite a precise figure from a summary " +
   "without confirming it against a specific recall.";
+const PROJECTION_TEXT_MAX = 420;
+function clampProjectionText(text, limit = PROJECTION_TEXT_MAX) {
+  const t = String(text || "").replace(/\s+\n/g, "\n").trim();
+  if (t.length <= limit) return t;
+  const ellipsis = " ...";
+  const budget = Math.max(1, limit - ellipsis.length);
+  const head = t.slice(0, budget);
+  const cut = Math.max(head.lastIndexOf(". "), head.lastIndexOf("; "), head.lastIndexOf(", "), head.lastIndexOf("\n"));
+  const trimmed = (cut > 0 ? head.slice(0, cut + 1) : head).trimEnd();
+  return `${trimmed}${ellipsis}`;
+}
 // The anchor's harness id is tracked in the `meta` kv (key `anchor_memory_id`) so it
 // ROUND-TRIPS like any projected survivor: it emits memory_id="" until first projected
 // (host ADD -> record-projection stores the assigned id here), then emits that real id so
@@ -3659,6 +3670,9 @@ function exportHarness(db, asOf) {
     const d = ageDays(n.first_seen, nowRef);
     const tag = tier === "episodic" ? ageTag(d) : null;
     const rendered = tier === "gist" ? renderNodeEnvelope(db, n) : (n.fact || "").trim();
+    const projected = tier === "episodic"
+      ? clampProjectionText(`[${tag}] ${rendered}`)
+      : clampProjectionText(rendered);
     return {
       memory_id: n.memory_id, signature: n.signature,
       category: n.salience || ((Number(n.salience_score) || 0) >= SAL_PROTECT ? "decision" : CLASS2CAT[n.class]) || "fact",
@@ -3666,14 +3680,14 @@ function exportHarness(db, asOf) {
       first_seen: tier === "gist" ? null : (n.first_seen || null),
       source_day: tier === "gist" ? null : (n.source_day || (n.first_seen || "").slice(0, 10) || null),
       age: tag,
-      fact: rendered,
+      fact: tier === "episodic" ? projected.replace(/^\[[^\]]+\]\s+/, "") : projected,
       // Ready-to-inject line: episodic facts are prefixed with their fuzzy age so the
       // temporal key survives into the host's context; gist facts stay timeless.
-      display: tier === "episodic" ? `[${tag}] ${(n.fact || "").trim()}` : rendered,
+      display: projected,
     };
   };
   const chronicleRec = (n) => {
-    const rendered = renderNodeEnvelope(db, n, { maxEntries: 4, maxSummaryChars: 600, maxEntryChars: 140 });
+    const rendered = clampProjectionText(renderNodeEnvelope(db, n, { maxEntries: 4, maxSummaryChars: 600, maxEntryChars: 140 }));
     return {
       memory_id: n.memory_id || "",
       signature: n.signature,
