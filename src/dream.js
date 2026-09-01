@@ -77,10 +77,10 @@ const FORGET = 0.15;
 const EDGE_DECAY = { mentions: 1.0, related_to: 0.985, similar_to: 0.97, supersedes: 1.0, sequence: 1.0, default: 0.99 }; // multiplicative per run
 
 // ---- ENTRY BUDGET ----------------------------------------------------------
-// The harness caps memory ENTRIES (= fact nodes; entity hubs are free db-side scaffolding).
-// Hard max 500; performance degrades past 250. Target 250 as the sweet spot. As the bank
-// approaches/exceeds target, dreaming escalates fading + merging. We prefer MERGE (fewer,
-// richer entries) over deletion — entry SIZE may grow to keep the COUNT down.
+// Active graph working-set budget, not total durable memory capacity. Dreamweave keeps
+// detail/archive facts durably outside this active set. The knobs bound what stays
+// embedded/projectable each night so recall stays fast; they do not mean "forget after N".
+// Scout's separate injected-memory harness remains capped at 500 entries.
 const ENTRY_TARGET = T.entryTarget; // capacity knob (env MEMORY_ENTRY_TARGET overrides)
 const ENTRY_MAX = T.entryMax;       // capacity knob (env MEMORY_ENTRY_MAX overrides)
 // TIER 2 ("RAG class"): the bounded graph+vector store recall searches. Embedded fact
@@ -93,7 +93,7 @@ const TIER2_MAX = T.tier2Max; // capacity+retention knobs (env MEMORY_TIER2_MAX 
 // delete them — they are inert keyword-only cold storage. Use this everywhere except the
 // explicit Tier-3 keyword recall. (Audit-hardened: archive must never reach decay,
 // evaporate, hard-cap, reactivation, salience, schema, or budget.)
-const ACTIVE_FACT = "kind='fact' AND (notes IS NULL OR notes<>'archive')";
+const ACTIVE_FACT = "kind='fact' AND (notes IS NULL OR notes NOT IN ('archive','detail'))";
 // Retain/tiered mode: when on, destructive eviction (ENTRY_MAX hard cap, weak-semantic
 // fade) is replaced by DEMOTION — we never physically delete a fact, we move it to Tier 3.
 const TIERED = () => T.tiered; // retention knob: preserve=tiered(demote), prune=destructive
@@ -1281,7 +1281,7 @@ async function weave(db, opts) {
   // 4) embed any ACTIVE node missing a vec row (new entity hubs / facts). Tier-3 archive
   //    nodes are intentionally un-embedded — never re-embed them (that's what makes them
   //    cheap), so they are excluded here.
-  const missing = db.prepare("SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes) AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.id);
+  const missing = db.prepare(`SELECT id FROM nodes WHERE id NOT IN (SELECT rowid FROM vec_nodes) AND ${ACTIVE_FACT}`).all().map((r) => r.id);
   if (missing.length) await profA(`weave.reembed(missing=${missing.length})`, () => reembed(db, missing, { languageService: L }));
   // 5) vector sibling links fact <-> fact, CORROBORATED.
   //    shared entity (co-mention overlap) -> related_to (trusted).
@@ -2477,8 +2477,9 @@ async function applyMerges(db, raw, opts = {}) {
   const weaveResult = decisions.length
     ? await profA("apply-merges.reweave", () => weave(db, { asOf: opts.asOf, languageService: L }))
     : null;
+  const allReportedClustersReviewed = input.legacy || validation.submitted >= currentReport.clusters.length;
   setMeta(db, "last_reflect", now);
-  setMeta(db, "last_reflect_seq", String(maxDirtySeq(db)));
+  setMeta(db, "last_reflect_seq", String(allReportedClustersReviewed ? maxDirtySeq(db) : currentReport.cursor_seq));
   repairGraph(db);
   return {
     surface: "merges",
@@ -3386,7 +3387,7 @@ function chronicleVectorDispersion(db, limit = 60) {
   };
 }
 function doctor(db) {
-  const facts = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").get().c;
+  const facts = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c;
   const archived = db.prepare("SELECT count(*) c FROM nodes WHERE kind='fact' AND notes='archive'").get().c;
   const entities = db.prepare("SELECT count(*) c FROM nodes WHERE kind='entity'").get().c;
   const edges = db.prepare("SELECT count(*) c FROM edges").get().c;
@@ -3394,16 +3395,16 @@ function doctor(db) {
   const dangling = db.prepare("SELECT src,dst FROM edges").all().filter((e) => !sigs.has(e.src) || !sigs.has(e.dst)).length;
   const deg = degreeMap(db);
   // Tier-3 archive nodes are intentionally edgeless (keyword-only) — not islands.
-  const islands = db.prepare("SELECT signature FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all().map((r) => r.signature).filter((s) => !deg.get(s));
+  const islands = db.prepare(`SELECT signature FROM nodes WHERE ${ACTIVE_FACT}`).all().map((r) => r.signature).filter((s) => !deg.get(s));
   const degsum = [...deg.values()].reduce((a, b) => a + b, 0);
   const activeMissingVectors = db.prepare(`
     SELECT count(*) c FROM nodes n
     LEFT JOIN vec_nodes v ON v.rowid=n.id
-    WHERE n.kind='fact' AND (n.notes IS NULL OR n.notes<>'archive') AND v.rowid IS NULL
+    WHERE ${ACTIVE_FACT.replaceAll("kind", "n.kind").replaceAll("notes", "n.notes")} AND v.rowid IS NULL
   `).get().c;
   const activeInArchive = db.prepare(`
     SELECT count(*) c FROM nodes n JOIN vec_archive v ON v.rowid=n.id
-    WHERE n.kind='fact' AND (n.notes IS NULL OR n.notes<>'archive')
+    WHERE ${ACTIVE_FACT.replaceAll("kind", "n.kind").replaceAll("notes", "n.notes")}
   `).get().c;
   const orphanActiveVectors = db.prepare("SELECT count(*) c FROM vec_nodes v LEFT JOIN nodes n ON n.id=v.rowid WHERE n.id IS NULL").get().c;
   const orphanArchiveVectors = db.prepare("SELECT count(*) c FROM vec_archive v LEFT JOIN nodes n ON n.id=v.rowid WHERE n.id IS NULL").get().c;
