@@ -3720,6 +3720,9 @@ function recordProjection(db, file) {
     // The anchor is synthesized (not a `nodes` row); persist its assigned harness id in
     // `meta` so it round-trips instead of being FORGOTten by the nightly projection sync.
     if (p.signature === "memory-usage-anchor") { setMeta(db, "anchor_memory_id", p.memory_id || ""); return; }
+    if (p.memory_id) {
+      db.prepare("UPDATE nodes SET memory_id='' WHERE memory_id=? AND signature<>?").run(p.memory_id, p.signature);
+    }
     db.prepare("UPDATE nodes SET memory_id=? WHERE signature=?").run(p.memory_id, p.signature);
   }))();
   return { recorded: pairs.length };
