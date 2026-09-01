@@ -391,7 +391,7 @@ function migrateModel(db) {
 // ---- INGEST -----------------------------------------------------------------
 async function ingestHarness(db, file, prune, asOf, backfillDates) {
   const raw = prof("ingest.parse", () => JSON.parse(fs.readFileSync(file, "utf8")));
-  const mems = Array.isArray(raw) ? raw : (raw.memories || []);
+  const mems = Array.isArray(raw) ? raw : (raw.entries || raw.memories || []);
   const now = asOf ? new Date(asOf).toISOString() : new Date().toISOString();
   // Preload existing memory_id -> {id,fact,salience,notes} ONCE (first-wins by id, matching
   // the previous unordered byMem.get). Re-confirming the full harness is the common case, so
@@ -536,7 +536,11 @@ async function ingestHarness(db, file, prune, asOf, backfillDates) {
   const dbIds = new Set(db.prepare("SELECT memory_id FROM nodes WHERE memory_id<>''").all().map((r) => r.memory_id));
   // The engine anchor (channel E) is tracked in meta, not as a node, so it is legitimately
   // absent from dbIds — exclude it from the completeness check (else ingest/verify gate falsely).
-  res.missing = mems.filter((m) => { const x = m.id || m.memory_id; return x && !dbIds.has(x) && !isAnchorFact(normalizeHarnessFact(m.fact)); }).map((m) => m.id || m.memory_id);
+  res.missing = mems.filter((m) => {
+    const x = m.id || m.memory_id;
+    const fact = normalizeHarnessFact(m.fact);
+    return x && !dbIds.has(x) && !isAnchorFact(fact) && !isRenderedEnvelope(fact);
+  }).map((m) => m.id || m.memory_id);
   res.complete = res.missing.length === 0;
   return res;
 }
@@ -574,9 +578,13 @@ function repairDatesFromText(db, { dryRun, allowLater } = {}) {
 
 function verifySync(db, file) {
   const raw = JSON.parse(fs.readFileSync(file, "utf8"));
-  const mems = Array.isArray(raw) ? raw : (raw.memories || []);
+  const mems = Array.isArray(raw) ? raw : (raw.entries || raw.memories || []);
   const dbIds = new Set(db.prepare("SELECT memory_id FROM nodes WHERE memory_id<>''").all().map((r) => r.memory_id));
-  const missing = mems.filter((m) => { const x = m.id || m.memory_id; return x && !dbIds.has(x) && !isAnchorFact(normalizeHarnessFact(m.fact)); }).map((m) => m.id || m.memory_id);
+  const missing = mems.filter((m) => {
+    const x = m.id || m.memory_id;
+    const fact = normalizeHarnessFact(m.fact);
+    return x && !dbIds.has(x) && !isAnchorFact(fact) && !isRenderedEnvelope(fact);
+  }).map((m) => m.id || m.memory_id);
   return { harness_count: mems.length, memory_ids_in_db: dbIds.size, missing, complete: missing.length === 0 };
 }
 
