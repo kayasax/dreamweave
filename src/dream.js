@@ -796,7 +796,7 @@ function dreamCoreImpl(db, flags) {
 
   // Active facts = Tier 1+2 (embedded, in graph). Archived (Tier 3) facts are inert cold
   // storage: skipped by decay/weave so they cost no nightly work, reachable only by keyword.
-  const facts = db.prepare("SELECT * FROM nodes WHERE kind='fact' AND (notes IS NULL OR notes<>'archive')").all();
+  const facts = db.prepare(`SELECT * FROM nodes WHERE ${ACTIVE_FACT}`).all();
   const bp = budgetParams(facts.length);
   const schema = prof("dreamCore.schemaFit", () => computeSchemaFit(db));
 
@@ -937,13 +937,59 @@ function dreamCoreImpl(db, flags) {
     }
   }
 
+  let demoted = 0;
+  const demoteActiveToArchive = (rows, reasonLabel) => {
+    const txD = db.transaction(() => {
+      for (const n of rows) {
+        for (const e of db.prepare("SELECT src,rel,dst,first_seen,last_reinforced FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").all(n.signature, n.signature)) {
+          preserveEvidenceTransition(db, e.src, e.rel, e.dst, e.first_seen, e.last_reinforced);
+        }
+        db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
+        const rid = BigInt(n.id);
+        const blob = storedVecBlob(db, n.id);
+        db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(rid);
+        if (blob) {
+          db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(rid);
+          db.prepare("INSERT INTO vec_archive(rowid, embedding) VALUES (?, ?)").run(rid, blob);
+        }
+        db.prepare("UPDATE nodes SET notes='archive', last_decayed=? WHERE id=?").run(nowIso, n.id);
+        J("evaporate", n.signature, reasonLabel);
+        demoted += 1;
+      }
+    });
+    txD();
+  };
+
+  const pickArchiveDemotions = (over, protectedSigsForRun) => {
+    const supTargets = new Set(db.prepare("SELECT dst FROM edges WHERE rel='supersedes'").all().map((r) => r.dst));
+    const cands = db.prepare(
+      `SELECT * FROM nodes WHERE ${ACTIVE_FACT} ORDER BY (notes='detail') DESC, (COALESCE(salience_score,0)>=${SAL_PROTECT}) ASC, (notes='gist') ASC, strength ASC, last_decayed ASC`
+    ).all();
+    const isHardProtected = (n) => protectedSigsForRun.has(n.signature) || supTargets.has(n.signature);
+    const demote = [];
+    for (const n of cands) {
+      if (demote.length >= over) break;
+      if (isHardProtected(n) || (Number(n.salience_score)||0) >= SAL_PROTECT || n.notes === "gist") continue;
+      demote.push(n);
+    }
+    if (demote.length < over) {
+      const picked = new Set(demote.map((n) => n.id));
+      for (const n of cands) {
+        if (demote.length >= over) break;
+        if (picked.has(n.id) || isHardProtected(n)) continue;
+        demote.push(n); picked.add(n.id);
+      }
+    }
+    return demote;
+  };
+
   // HARD CEILING (faithful to Scout's native harness: a physical max of ENTRY_MAX entries).
   // Decay/evaporate above are the graceful path; in batch/headless runs there is no agent to
   // perform merges, so we deterministically evict the weakest facts down to the cap. Salient
   // is protected first, then this-run-new/reactivated, then lowest strength is dropped.
   // SKIPPED in TIERED mode: there the Tier-2 demotion (below) bounds the embedded set by
   // MOVING overflow to Tier 3, never deleting — so the physical ENTRY_MAX delete must not run.
-  let evapCap = 0;
+  let evapCap = 0, demotedForEntryMax = 0;
   const factCountNow = () => db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c;
   if (!TIERED() && factCountNow() > ENTRY_MAX) {
     const over = factCountNow() - ENTRY_MAX;
@@ -969,6 +1015,12 @@ function dreamCoreImpl(db, flags) {
       evapCap += 1;
     }
   }
+  if (TIERED() && factCountNow() > ENTRY_MAX) {
+    const over = factCountNow() - ENTRY_MAX;
+    const demote = pickArchiveDemotions(over, protectedSigs);
+    demoteActiveToArchive(demote, `demoted to Tier3 archive (over active cap ${ENTRY_MAX})`);
+    demotedForEntryMax = demote.length;
+  }
 
   // TIER 2 CAP: demote the weakest EMBEDDED facts to Tier 3 (raw keyword archive) when
   // the graph+vector store exceeds TIER2_MAX. Demotion ≠ deletion: the node + its raw
@@ -976,12 +1028,10 @@ function dreamCoreImpl(db, flags) {
   // so it no longer costs nightly weave/embed work and is reachable only by keyword
   // search. Protect salient + gist + this-run-new/reactivated; demote details/oldest
   // first. This is what keeps cost bounded while "remembering everything".
-  let demoted = 0;
   if (TIER2_MAX > 0) {
     const embeddedCount = () => db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT}`).get().c;
     if (embeddedCount() > TIER2_MAX) {
       const over = embeddedCount() - TIER2_MAX;
-      const supTargets = new Set(db.prepare("SELECT dst FROM edges WHERE rel='supersedes'").all().map((r) => r.dst));
       // Demotion priority (keep the active set bounded NO MATTER WHAT, like a real
       // associative store): detail first, then weak/old episodic, then weak/old semantic,
       // and finally — only if still over — the weakest/oldest GIST and SALIENT too. Even
@@ -989,51 +1039,8 @@ function dreamCoreImpl(db, flags) {
       // (still findable, just not in the hot RAG set). Hard-protect ONLY this-run-new and
       // supersede targets (needed for the current operation). This guarantees the cap holds
       // so nightly cost stays bounded — the C4 accumulation fix.
-      const cands = db.prepare(
-        `SELECT * FROM nodes WHERE ${ACTIVE_FACT} ORDER BY (notes='detail') DESC, (COALESCE(salience_score,0)>=${SAL_PROTECT}) ASC, (notes='gist') ASC, strength ASC, last_decayed ASC`
-      ).all();
-      const isHardProtected = (n) => protectedSigs.has(n.signature) || supTargets.has(n.signature);
-      const demote = [];
-      // pass 1: prefer to keep salient/gist — demote everything else first
-      for (const n of cands) {
-        if (demote.length >= over) break;
-        if (isHardProtected(n) || (Number(n.salience_score)||0) >= SAL_PROTECT || n.notes === "gist") continue;
-        demote.push(n);
-      }
-      // pass 2: still over cap (salient/gist alone exceed it) — demote the weakest/oldest
-      // of those too, so the embedded set is ALWAYS bounded. Only new/supersede stay.
-      if (demote.length < over) {
-        const picked = new Set(demote.map((n) => n.id));
-        for (const n of cands) {
-          if (demote.length >= over) break;
-          if (picked.has(n.id) || isHardProtected(n)) continue;
-          demote.push(n); picked.add(n.id);
-        }
-      }
-      // Atomic: a crash mid-demotion must not leave an active node without its vector/edges.
-      const txD = db.transaction(() => {
-        for (const n of demote) {
-          for (const e of db.prepare("SELECT src,rel,dst,first_seen,last_reinforced FROM edges WHERE (src=? OR dst=?) AND rel IN ('sequence','supersedes')").all(n.signature, n.signature)) {
-            preserveEvidenceTransition(db, e.src, e.rel, e.dst, e.first_seen, e.last_reinforced);
-          }
-          db.prepare("DELETE FROM edges WHERE src=? OR dst=?").run(n.signature, n.signature);
-          // MOVE the embedding to vec_archive (principle 1 pay-once / principle 3 demote-
-          // don't-delete): the cold fact stays reachable by SIMILARITY (recall.js tier-2c
-          // queries vec_archive secondarily, capped below active seeds), while leaving
-          // vec_nodes — the only table any nightly KNN touches — bounded (principle 2).
-          const rid = BigInt(n.id);
-          const blob = storedVecBlob(db, n.id);
-          db.prepare("DELETE FROM vec_nodes WHERE rowid=?").run(rid);
-          if (blob) {
-            db.prepare("DELETE FROM vec_archive WHERE rowid=?").run(rid);
-            db.prepare("INSERT INTO vec_archive(rowid, embedding) VALUES (?, ?)").run(rid, blob);
-          }
-          db.prepare("UPDATE nodes SET notes='archive', last_decayed=? WHERE id=?").run(nowIso, n.id);
-          J("evaporate", n.signature, `demoted to Tier3 archive (over Tier2 cap ${TIER2_MAX})`);
-          demoted += 1;
-        }
-      });
-      txD();
+      const demote = pickArchiveDemotions(over, protectedSigs);
+      demoteActiveToArchive(demote, `demoted to Tier3 archive (over Tier2 cap ${TIER2_MAX})`);
     }
   }
 
@@ -1080,7 +1087,7 @@ function dreamCoreImpl(db, flags) {
   const ins = db.prepare(`INSERT INTO dream_journal(dreamed_at,run_id,op,memory_id,signature,category,original_fact,result_fact,reason)
     VALUES (@dreamed_at,@run_id,@op,@memory_id,@signature,@category,@original_fact,@result_fact,@reason)`);
   db.transaction(() => journal.forEach((j) => ins.run(j)))();
-  const result = { runId, summary, facts: final, archived: archivedNow, target: ENTRY_TARGET, max: ENTRY_MAX, status: after.status, pressure: after.pressure, evaporated_episodic: evap, evaporated_semantic: evapSem, evicted_over_cap: evapCap, demoted_to_tier3: demoted, chronicles_demoted: chronicleDemoted, pruned_hubs: prunedHubs, reactivated: reentered.size, promoted_semantic: 0, semantic_review_candidates: semanticReady };
+  const result = { runId, summary, facts: final, archived: archivedNow, target: ENTRY_TARGET, max: ENTRY_MAX, status: after.status, pressure: after.pressure, evaporated_episodic: evap, evaporated_semantic: evapSem, evicted_over_cap: evapCap, demoted_to_tier3: demoted, demoted_for_entry_max: demotedForEntryMax, chronicles_demoted: chronicleDemoted, pruned_hubs: prunedHubs, reactivated: reentered.size, promoted_semantic: 0, semantic_review_candidates: semanticReady };
   if (overBy > 0) result.action_needed = `Still ${overBy} over target. Run 'consolidate' and merge the reported clusters (agent) to reduce entry count.`;
   return result;
 }
@@ -3388,16 +3395,22 @@ async function budget(db) {
   // forecast what a dream run would evaporate at current strengths (active facts only)
   const epEvap = db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT} AND class='episodic' AND strength < ?`).get(bp.forgetThreshold).c;
   const semEvap = bp.semanticFade > 0 ? db.prepare(`SELECT count(*) c FROM nodes WHERE ${ACTIVE_FACT} AND class='semantic' AND strength < ?`).get(bp.semanticFade).c : 0;
+  const activeCapDemote = TIERED() ? Math.max(0, factCount - ENTRY_MAX) : 0;
   const merge = await consolidate(db, {});
-  const projected = factCount - epEvap - semEvap - merge.entries_reclaimable;
+  const projected = factCount - (TIERED() ? activeCapDemote : epEvap + semEvap) - merge.entries_reclaimable;
+  const nextAction = TIERED() && activeCapDemote > 0
+    ? `Run 'dream' to demote ${activeCapDemote} active overflow entries to archive without deleting them, then merge clusters`
+    : TIERED()
+      ? "Active overflow is already archived; continue merging clusters"
+      : `Run 'dream' (auto fades ${epEvap + semEvap}), then merge clusters`;
   return {
     facts: factCount, target: ENTRY_TARGET, max: ENTRY_MAX, status: bp.status, pressure: bp.pressure,
     over_target_by: Math.max(0, factCount - ENTRY_TARGET),
     adaptive_params: { forgetThreshold: bp.forgetThreshold, decayAccel: bp.decayAccel, mergeSim: bp.mergeSim, semanticFade: bp.semanticFade },
-    forecast: { evaporate_episodic: epEvap, evaporate_semantic: semEvap, merge_clusters: merge.candidate_merge_clusters, entries_reclaimable_by_merge: merge.entries_reclaimable, projected_entries_after_full_pass: projected },
+    forecast: { evaporate_episodic: TIERED() ? 0 : epEvap, evaporate_semantic: TIERED() ? 0 : semEvap, demote_to_archive_for_active_max: activeCapDemote, merge_clusters: merge.candidate_merge_clusters, entries_reclaimable_by_merge: merge.entries_reclaimable, projected_entries_after_full_pass: projected },
     recommendation: factCount <= ENTRY_TARGET
       ? "Within budget. Normal nightly dream maintains it."
-      : `Over target by ${factCount - ENTRY_TARGET}. Run 'dream' (auto fades ${epEvap + semEvap}), then 'consolidate' and merge clusters (agent) to reclaim ~${merge.entries_reclaimable}. Projected ~${projected}.`,
+      : `Over target by ${factCount - ENTRY_TARGET}. ${nextAction} to reclaim ~${merge.entries_reclaimable}. Projected ~${projected}.`,
   };
 }
 
