@@ -2178,6 +2178,70 @@ async function reportMerges(db, opts = {}) {
   return { surface: "merges", report_id: reportId, basis_seq: basisSeq, cursor_seq: lastReflectSeq, clusters };
 }
 
+function normalizeProjectionFactText(value) {
+  return String(value || "").replace(/^\[[^\]]+\]\s+/, "").replace(/\s+/g, " ").trim();
+}
+
+function exactMergeDecisions(report, limit = 50) {
+  const decisions = [];
+  for (const cluster of report.clusters || []) {
+    const groups = new Map();
+    for (const member of cluster) {
+      const text = normalizeProjectionFactText(member.fact);
+      if (text.length < 40) continue;
+      if (!groups.has(text)) groups.set(text, []);
+      groups.get(text).push(member);
+    }
+    for (const [text, members] of groups) {
+      if (members.length < 2) continue;
+      members.sort((a, b) => (a.tier === "gist" ? 0 : 1) - (b.tier === "gist" ? 0 : 1)
+        || String(a.sourceDay || a.evidenceStart || "9999").localeCompare(String(b.sourceDay || b.evidenceStart || "9999"))
+        || a.sig.localeCompare(b.sig));
+      const survivor = members[0];
+      decisions.push({
+        fact: text,
+        survivorSig: survivor.sig,
+        memberSigs: members.map((m) => m.sig),
+        temporalForm: "atemporal",
+        landmarks: { current: [survivor.sig] },
+      });
+      break;
+    }
+    if (decisions.length >= limit) break;
+  }
+  return decisions;
+}
+
+async function autoMergeExact(db, opts = {}) {
+  const report = await reportMerges(db, opts);
+  const limit = Number.isFinite(Number(opts.limit)) ? Math.max(1, Number(opts.limit)) : 50;
+  const decisions = exactMergeDecisions(report, limit);
+  if (!decisions.length) {
+    return {
+      surface: "auto-merge-exact",
+      complete: true,
+      report_id: report.report_id,
+      clusters_seen: report.clusters.length,
+      decisions: 0,
+      clusters_merged: 0,
+      details_retained: 0,
+      apply: null,
+    };
+  }
+  const apply = await applyMerges(db, { report_id: report.report_id, decisions }, opts);
+  return {
+    surface: "auto-merge-exact",
+    complete: apply.complete,
+    report_id: report.report_id,
+    clusters_seen: report.clusters.length,
+    decisions: decisions.length,
+    clusters_merged: apply.clusters_merged,
+    details_retained: apply.details_retained,
+    rejected: apply.rejected || [],
+    apply,
+  };
+}
+
 function normalizeMergeInput(raw) {
   if (Array.isArray(raw)) return { legacy: true, reportId: null, decisions: raw };
   if (raw && typeof raw === "object" && Array.isArray(raw.decisions)) {
@@ -4104,6 +4168,7 @@ async function main() {
       }
     }
     else if (cmd === "report-merges" || cmd === "consolidate") r = await reportMerges(db, { asOf: flags["as-of"], sim: Number(flags.sim) || 0 });
+    else if (cmd === "auto-merge-exact") { r = await autoMergeExact(db, { asOf: flags["as-of"], sim: Number(flags.sim) || 0, limit: flags.limit }); gate = r.complete === false; }
     else if (cmd === "apply-merges") { r = await applyMerges(db, readDecisionFile(flags.file), { asOf: flags["as-of"], sim: Number(flags.sim) || 0 }); gate = r.complete === false; }
     else if (cmd === "report-synthesis") r = reportSynthesis(db, { asOf: flags["as-of"] });
     else if (cmd === "apply-synthesis") { r = await applySynthesis(db, readDecisionFile(flags.file), { asOf: flags["as-of"] }); gate = r.complete === false; }
@@ -4141,7 +4206,7 @@ async function main() {
     else if (cmd === "export-viz") r = exportViz(db);
     else if (cmd === "stats") r = stats(db);
     else if (cmd === "config") r = configCmd(process.argv);
-    else { console.error("Usage: node src/dream.js <init|migrate-model|ingest-harness|verify-sync|repair-dates|dream|weave|report-entities|apply-entities|report-aliases|apply-aliases|report-merges|apply-merges|report-salience|apply-salience|report-synthesis|apply-synthesis|report-chronicles|apply-chronicles|consolidate|budget|doctor|export-harness|record-projection|export-viz|stats|config> [flags]"); process.exitCode = 2; return; }
+    else { console.error("Usage: node src/dream.js <init|migrate-model|ingest-harness|verify-sync|repair-dates|dream|weave|report-entities|apply-entities|report-aliases|apply-aliases|report-merges|apply-merges|auto-merge-exact|report-salience|apply-salience|report-synthesis|apply-synthesis|report-chronicles|apply-chronicles|consolidate|budget|doctor|export-harness|record-projection|export-viz|stats|config> [flags]"); process.exitCode = 2; return; }
     console.log(JSON.stringify(r, null, 2));
     if (gate) process.exitCode = 3;
   } finally { db.close(); }
@@ -4173,5 +4238,6 @@ module.exports = {
   doctor,
   exportHarness,
   ingestHarness,
+  autoMergeExact,
   projectEmbeddings3D,
 };
