@@ -83,8 +83,8 @@ process.env.AGENT_MEMORY_DIR = dataDir;
   if (!projected || projected.first_seen !== null || projected.source_day !== null) {
     throw new Error("projected gist exposed an episode source date");
   }
-  if (gistRow.temporal_form !== "trajectory" || !/SEMANTIC MEMORY · EVOLVING/.test(projected.fact || "")) {
-    throw new Error("projected gist did not disclose its temporal trajectory");
+  if (gistRow.temporal_form !== "trajectory" || /SEMANTIC MEMORY/.test(projected.fact || "")) {
+    throw new Error("projected gist leaked an internal semantic envelope into Scout memory");
   }
   const durableTransitions = db.prepare("SELECT src_sig,rel,dst_sig FROM evidence_transitions WHERE rel='sequence' ORDER BY first_seen").all();
   if (durableTransitions.length < 2 || durableTransitions.some((e) => e.src_sig === gistRow.signature || e.dst_sig === gistRow.signature)) {

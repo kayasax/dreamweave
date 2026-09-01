@@ -3629,13 +3629,36 @@ function exportHarness(db, asOf) {
   const nowRef = asOf ? new Date(asOf) : (latest ? new Date(latest) : new Date());
 
   const isGist = (n) => n.notes && /\bgist\b/.test(n.notes);
+  const projectionQuality = (n) => {
+    const text = String(n.fact || n.text || "");
+    if (isRenderedEnvelope(text)) return 0;
+    if (/\.\.\.\s*$/.test(text) || /\.\.\./.test(text)) return 0;
+    return 1;
+  };
+  const isCorrectionLike = (n) => /^\s*(?:CORRECTION|RESEARCH:\s*Correction)/i.test(String(n.fact || n.text || ""));
+  const applyCorrectionBudget = (items, limit) => {
+    const out = [];
+    let correctionCount = 0;
+    for (const item of items) {
+      if (isCorrectionLike(item)) {
+        if (correctionCount >= limit) continue;
+        correctionCount += 1;
+      }
+      out.push(item);
+    }
+    return out;
+  };
   // Salience (importance) ranks a gist above plain semantic/episodic; durability class breaks ties below.
   const rank = (n) => ((Number(n.salience_score) || 0) >= SAL_PROTECT ? 2 : ({ semantic: 1, episodic: 0 }[n.class] || 0));
 
+  const byRecencyDesc = (a, b) => (Date.parse(b.source_day || b.first_seen || "") || 0) - (Date.parse(a.source_day || a.first_seen || "") || 0)
+    || projectionQuality(b) - projectionQuality(a)
+    || (b.strength || 0) - (a.strength || 0)
+    || a.signature.localeCompare(b.signature);
   const gist = facts.filter(isGist)
-    .sort((a, b) => rank(b) - rank(a) || (b.strength || 0) - (a.strength || 0) || a.signature.localeCompare(b.signature));
+    .sort((a, b) => projectionQuality(b) - projectionQuality(a) || rank(b) - rank(a) || (b.strength || 0) - (a.strength || 0) || a.signature.localeCompare(b.signature));
   const episodic = facts.filter((n) => !isGist(n))
-    .sort((a, b) => (Date.parse(a.first_seen || "") || 0) - (Date.parse(b.first_seen || "") || 0) || a.signature.localeCompare(b.signature));
+    .sort((a, b) => projectionQuality(b) - projectionQuality(a) || (Date.parse(a.first_seen || "") || 0) - (Date.parse(b.first_seen || "") || 0) || a.signature.localeCompare(b.signature));
   const chronicleRows = db.prepare(`
     SELECT n.*,c.resolution,c.period_start,c.period_end,c.compression_level,c.version
     FROM nodes n JOIN chronicles c ON c.node_sig=n.signature
@@ -3663,13 +3686,24 @@ function exportHarness(db, asOf) {
   const totalSlots = Math.max(1, ENTRY_MAX - 1);
   const temporalSlots = chronicle.length ? Math.min(chronicle.length, Math.floor(totalSlots * 0.2)) : 0;
   const factSlots = totalSlots - temporalSlots;
-  const projectedFacts = [...gist, ...episodic].slice(0, factSlots);
+  const recentSlots = Math.min(Math.floor(factSlots * 0.2), factSlots);
+  const recentFacts = facts
+    .filter((n) => !isGist(n))
+    .sort(byRecencyDesc)
+    .slice(0, recentSlots);
+  const selectedFactSigs = new Set(recentFacts.map((n) => n.signature));
+  const correctionSlots = Math.min(8, factSlots);
+  const projectedFacts = applyCorrectionBudget([
+    ...recentFacts,
+    ...gist.filter((n) => !selectedFactSigs.has(n.signature)),
+    ...episodic.filter((n) => !selectedFactSigs.has(n.signature)),
+  ], correctionSlots).slice(0, factSlots);
   const projectedChronicles = chronicle.slice(0, temporalSlots);
 
   const rec = (n, tier) => {
     const d = ageDays(n.first_seen, nowRef);
     const tag = tier === "episodic" ? ageTag(d) : null;
-    const rendered = tier === "gist" ? renderNodeEnvelope(db, n) : (n.fact || "").trim();
+    const rendered = (n.fact || "").trim();
     const projected = tier === "episodic"
       ? clampProjectionText(`[${tag}] ${rendered}`)
       : clampProjectionText(rendered);

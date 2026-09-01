@@ -2,10 +2,8 @@
 
 // The rendered envelope must never become the stored fact.
 //
-// `export-harness` does not project raw `fact` text: gists go out through
-// renderSemanticEnvelope and chronicles through renderChronicleEnvelope, which wrap the fact
-// in a header ("[SEMANTIC MEMORY - STABLE]", a derived-index notice, "Memory family: ...").
-// That rendering is what the host stores via m_remember.
+// `export-harness` projects raw gist `fact` text into Scout. Semantic envelopes are
+// retained for Dreamweave graph/recall surfaces, not written into Scout memories.
 //
 // `ingest-harness` then reads the harness back and compares the incoming text to the stored
 // fact. The envelope makes them differ, so `updChanged` overwrites the stored fact WITH THE
@@ -23,6 +21,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { execFileSync } = require("child_process");
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "dw-envelope-"));
 process.env.AGENT_MEMORY_DIR = dataDir;
@@ -31,6 +30,7 @@ const Database = require("better-sqlite3");
 const sqliteVec = require("sqlite-vec");
 const { ensureSchema } = require("../src/schema");
 const { exportHarness, ingestHarness } = require("../src/dream");
+const { renderNodeEnvelope } = require("../src/memory-render");
 
 const fail = (m) => { console.error(`FAIL: ${m}`); process.exit(1); };
 
@@ -57,15 +57,17 @@ const recordFor = (sig) => {
 
 const storedFact = () => db.prepare("SELECT fact FROM nodes WHERE signature=?").get("fact:gateway-owner").fact;
 
-// The projection is an envelope, not the raw fact -- this is the precondition for the bug.
+// The projection must be the raw fact. Envelopes are useful for internal recall,
+// but they are not useful Scout memory content and must not consume the 420-char budget.
 const projected = recordFor("fact:gateway-owner").display;
-if (!/^\[SEMANTIC MEMORY/.test(projected)) fail(`expected the gist to project wrapped in an envelope, got: ${projected.slice(0, 60)}`);
-if (projected === GIST_FACT) fail("gist projected raw; this test no longer exercises the envelope round trip");
+if (projected !== GIST_FACT) fail(`expected raw gist fact projection, got: ${projected.slice(0, 120)}`);
+const envelope = renderNodeEnvelope(db, db.prepare("SELECT * FROM nodes WHERE signature=?").get("fact:gateway-owner"));
+if (!/^\[SEMANTIC MEMORY/.test(envelope)) fail("test setup did not render a semantic envelope");
 
 (async () => {
   // Round 1: the harness now holds what we projected. Ingest it back.
   const snap1 = path.join(dataDir, "snap1.json");
-  fs.writeFileSync(snap1, JSON.stringify([{ id: GIST_ID, fact: projected, category: "fact" }]));
+  fs.writeFileSync(snap1, JSON.stringify([{ id: GIST_ID, fact: envelope, category: "fact" }]));
   await ingestHarness(db, snap1, false, now, false);
 
   if (storedFact() !== GIST_FACT) {
@@ -75,7 +77,7 @@ if (projected === GIST_FACT) fail("gist projected raw; this test no longer exerc
   // Round 2: the fact must not accumulate a second header.
   const projected2 = recordFor("fact:gateway-owner").display;
   const headers = (projected2.match(/\[SEMANTIC MEMORY/g) || []).length;
-  if (headers !== 1) fail(`envelope compounded: ${headers} headers in the projected text`);
+  if (headers !== 0) fail(`semantic envelope leaked into Scout projection: ${headers} headers in the projected text`);
   if (projected2 !== projected) fail("projection is not stable across an ingest round trip");
 
   const snap2 = path.join(dataDir, "snap2.json");
@@ -98,11 +100,20 @@ if (projected === GIST_FACT) fail("gist projected raw; this test no longer exerc
   const before = db.prepare("SELECT count(*) c FROM nodes").get().c;
   const snap4 = path.join(dataDir, "snap4.json");
   fs.writeFileSync(snap4, JSON.stringify([
-    { id: "harness-unbound-1", fact: projected, category: "fact" },
+    { id: "harness-unbound-1", fact: envelope, category: "fact" },
   ]));
   await ingestHarness(db, snap4, false, now, false);
   const after = db.prepare("SELECT count(*) c FROM nodes").get().c;
   if (after !== before) fail(`ingest created ${after - before} node(s) from engine-rendered envelope text`);
+
+  const verify = JSON.parse(execFileSync(
+    process.execPath,
+    [path.join(__dirname, "..", "src", "dream.js"), "verify-sync", "--file", snap4],
+    { encoding: "utf8", env: { ...process.env, AGENT_MEMORY_DIR: dataDir } },
+  ));
+  if (!verify.complete || verify.missing.length) {
+    fail("verify-sync rejected an intentionally skipped rendered envelope");
+  }
 
   console.log("PASS ✓ rendered envelopes never become stored facts; real user edits still land");
 })().catch((e) => fail(e && e.stack || String(e)));
