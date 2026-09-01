@@ -3745,33 +3745,8 @@ function exportHarness(db, asOf) {
     .sort((a, b) => projectionQuality(b) - projectionQuality(a) || rank(b) - rank(a) || (b.strength || 0) - (a.strength || 0) || a.signature.localeCompare(b.signature));
   const episodic = facts.filter((n) => !isGist(n))
     .sort((a, b) => projectionQuality(b) - projectionQuality(a) || (Date.parse(a.first_seen || "") || 0) - (Date.parse(b.first_seen || "") || 0) || a.signature.localeCompare(b.signature));
-  const chronicleRows = db.prepare(`
-    SELECT n.*,c.resolution,c.period_start,c.period_end,c.compression_level,c.version
-    FROM nodes n JOIN chronicles c ON c.node_sig=n.signature
-    WHERE n.kind='chronicle' AND coalesce(n.notes,'')<>'archive'
-  `).all();
-  // A period has exactly ONE current chronicle. Re-summarizing writes a new version and the
-  // prior head is archived, but archive state is bookkeeping that other paths can disturb —
-  // so enforce the invariant here rather than trusting it. Without this, a period projects
-  // twice: its stale text next to its replacement.
-  const headByPeriod = new Map();
-  for (const n of chronicleRows) {
-    const key = `${n.resolution}:${n.period_start}:${n.period_end}`;
-    const cur = headByPeriod.get(key);
-    if (!cur || (Number(n.version) || 0) > (Number(cur.version) || 0)) headByPeriod.set(key, n);
-  }
-  const desiredResolution = (age) => age <= 14 ? "day" : age <= 90 ? "week" : age <= 730 ? "month" : age <= 1460 ? "quarter" : "year";
-  const chronicle = [...headByPeriod.values()]
-    .filter((n) => {
-      const age = Math.max(0, (nowRef.getTime() - Date.parse(`${n.period_end}T23:59:59Z`)) / dayMs);
-      return n.resolution === desiredResolution(age);
-    })
-    .sort((a, b) => (Date.parse(b.period_end || "") || 0) - (Date.parse(a.period_end || "") || 0)
-      || a.signature.localeCompare(b.signature));
-
   const totalSlots = Math.max(1, ENTRY_MAX - 1);
-  const temporalSlots = chronicle.length ? Math.min(chronicle.length, Math.floor(totalSlots * 0.2)) : 0;
-  const factSlots = totalSlots - temporalSlots;
+  const factSlots = totalSlots;
   const recentSlots = Math.min(Math.floor(factSlots * 0.2), factSlots);
   const recentFacts = facts
     .filter((n) => !isGist(n))
@@ -3784,7 +3759,6 @@ function exportHarness(db, asOf) {
     ...gist.filter((n) => !selectedFactSigs.has(n.signature)),
     ...episodic.filter((n) => !selectedFactSigs.has(n.signature)),
   ], correctionSlots).slice(0, factSlots);
-  const projectedChronicles = chronicle.slice(0, temporalSlots);
 
   const rec = (n, tier) => {
     const d = ageDays(n.first_seen, nowRef);
@@ -3806,31 +3780,12 @@ function exportHarness(db, asOf) {
       display: projected,
     };
   };
-  const chronicleRec = (n) => {
-    const rendered = clampProjectionText(renderNodeEnvelope(db, n, { maxEntries: 4, maxSummaryChars: 600, maxEntryChars: 140 }));
-    return {
-      memory_id: n.memory_id || "",
-      signature: n.signature,
-      category: "timeline",
-      tier: "chronicle",
-      strength: Number((n.strength || 0).toFixed(3)),
-      first_seen: null,
-      source_day: null,
-      age: null,
-      period_start: n.period_start,
-      period_end: n.period_end,
-      resolution: n.resolution,
-      fact: rendered,
-      display: rendered,
-    };
-  };
-
   // Gist first (primacy for standing facts), then the episodic timeline in order.
+  // Chronicles stay in Dreamweave as evidence indexes; Scout memory receives usable facts only.
   // The engine-owned anchor memory always leads (channel E).
   return [
     anchorRecord(db),
     ...projectedFacts.map((n) => rec(n, isGist(n) ? "gist" : "episodic")),
-    ...projectedChronicles.map(chronicleRec),
   ];
 }
 
